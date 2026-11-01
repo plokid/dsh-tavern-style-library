@@ -1,0 +1,33 @@
+{
+  "name": "dsh-tavern-style-library",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Tavern 插件：自建参考样文库，按笔调标签给正文注入文风参考",
+  "keywords": [
+    "dsh",
+    "dsh-tavern",
+    "tavern-plugin",
+    "writing-style",
+    "roleplay"
+  ],
+  "license": "MIT",
+  "author": "plokid",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/plokid/dsh-tavern-style-library.git"
+  },
+  "homepage": "https://github.com/plokid/dsh-tavern-style-library#readme",
+  "bugs": {
+    "url": "https://github.com/plokid/dsh-tavern-style-library/issues"
+  },
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": ["dsh-tavern-plugin"]
+    }
+  }
+}
