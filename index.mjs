@@ -1091,6 +1091,42 @@ export function apply(ctx, config = {}) {
     return { data: await persist(next), removed }
   }
 
+  // 移动摘录：拆库的主力。目标库满 40 条时只移装得下的，其余跳过并回报条数。
+  // 摘录 id 跟着搬过去——它只在本库内唯一，搬过去不会和谁撞。
+  async function moveSamples(fromLibraryId, toLibraryId, sampleIds) {
+    const data = await load()
+    const next = { ...data, libraries: cloneLibraries(data) }
+    const from = next.libraries.find(item => item.id === str(fromLibraryId))
+    const to = next.libraries.find(item => item.id === str(toLibraryId))
+    if (!from) throw new Error('没有源样文库')
+    if (!to) throw new Error('没有目标样文库')
+    if (from.id === to.id) throw new Error('源库和目标库是同一个')
+
+    const wanted = new Set((Array.isArray(sampleIds) ? sampleIds : []).map(item => str(item)).filter(Boolean))
+    if (wanted.size === 0) throw new Error('先选要移动的摘录')
+
+    const moved = []
+    let skipped = 0
+    for (const sample of from.samples) {
+      if (!wanted.has(sample.id)) continue
+      if (to.samples.length >= MAX_SAMPLES_PER_LIBRARY) { skipped += 1; continue }
+      to.samples.push({ id: sample.id, text: sample.text, source: sample.source, tags: [...sample.tags] })
+      moved.push(sample.id)
+    }
+    if (moved.length === 0) {
+      throw new Error(to.samples.length >= MAX_SAMPLES_PER_LIBRARY
+        ? '「' + to.name + '」已经装满 ' + MAX_SAMPLES_PER_LIBRARY + ' 条了，先腾点位置再移'
+        : '没有匹配的摘录')
+    }
+
+    const movedSet = new Set(moved)
+    from.samples = from.samples.filter(item => !movedSet.has(item.id))
+    from.updatedAt = Date.now()
+    to.updatedAt = Date.now()
+    const saved = await persist(next)
+    return { data: saved, moved: moved.length, skipped, from: from.name, to: to.name }
+  }
+
   function libraryBrief(library) {
     return {
       id: library.id,
@@ -1311,6 +1347,20 @@ export function apply(ctx, config = {}) {
   handle('delete-sample', async ({ libraryId, sampleId } = {}) => {
     const out = await removeSamples(libraryId, [sampleId])
     return { data: out.data }
+  })
+
+  // 批量删：整理时一条一条点太费手，面板的「整理」模式一次删一批。
+  handle('delete-samples', async ({ libraryId, sampleIds } = {}) => {
+    const out = await removeSamples(libraryId, sampleIds)
+    return { data: out.data, removed: out.removed }
+  })
+
+  // 移动摘录：拆库的主力。目标库满 40 条时只移装得下的，其余跳过并回报条数。
+  handle('move-samples', async ({ fromLibraryId, toLibraryId, sampleIds } = {}) => {
+    const data = await load()
+    const from = libraryOf(data, fromLibraryId)
+    const to = libraryOf(data, toLibraryId)
+    return await moveSamples(from.id, to.id, sampleIds)
   })
 
   // 老接口：只加不删，客户端和旧调用还在用，保留。
@@ -1862,6 +1912,43 @@ export function apply(ctx, config = {}) {
           skipped: out.skipped,
           text: lines.join('\n'),
         }
+      },
+    })
+
+    // 拆库的主力工具：把一个库里的一部分摘录挪到另一个库。
+    // 没有它，拆库只能「新建 → 复制一遍 → 回原库一条条删」。
+    add({
+      name: 'style_sample_move',
+      description: '把若干条摘录从一个样文库移到另一个样文库（拆库、或把某一类笔调集中起来时用）。'
+        + '移动会同时从原库删除，不需要再手动删。目标库最多 40 条，装不下的会跳过并回报。',
+      parameters: {
+        type: 'object', additionalProperties: false, required: ['from', 'to', 'ids'],
+        properties: {
+          from: { type: 'string', description: '源库名或 id。' },
+          to: { type: 'string', description: '目标库名或 id。' },
+          ids: {
+            type: 'array', items: { type: 'string' },
+            description: '要移动的摘录 id。先用 style_library_list 或面板看清是哪几条。',
+          },
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            moved: { type: 'number' }, skipped: { type: 'number' }, text: { type: 'string' },
+          },
+        },
+        render: (_args, value) => [{ type: 'text', text: String((value && value.text) || '') }],
+      },
+      async execute(args) {
+        const data = await load()
+        const from = libraryOf(data, args && args.from)
+        const to = libraryOf(data, args && args.to)
+        const out = await moveSamples(from.id, to.id, args && args.ids)
+        const lines = ['从「' + out.from + '」移了 ' + out.moved + ' 条到「' + out.to + '」。']
+        if (out.skipped) lines.push('有 ' + out.skipped + ' 条没移成：目标库满了（上限 ' + MAX_SAMPLES_PER_LIBRARY + ' 条）。')
+        return { moved: out.moved, skipped: out.skipped, text: lines.join('\n') }
       },
     })
 

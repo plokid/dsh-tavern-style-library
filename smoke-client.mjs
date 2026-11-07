@@ -834,6 +834,46 @@ await check('「本局使用」能勾多个库', async () => {
   assert.equal(byText(tree, '本局使用中').length + byText(tree, '取消').length >= 2, true, '两个都应显示为已选')
 })
 
+await check('「整理」勾几条一起移到另一个库', async () => {
+  const calls = []
+  const ui = makeUi({
+    'move-samples': async payload => { calls.push(payload); return { data: { libraries: [] }, moved: 1, skipped: 0 } },
+  })
+  const source = {
+    id: 'l1', name: '源库', tags: [], note: '', mode: 'sample',
+    samples: [
+      { id: 's1', text: '第一条', tags: [], source: 'S1' },
+      { id: 's2', text: '第二条', tags: [], source: 'S2' },
+      { id: 's3', text: '第三条', tags: [], source: 'S3' },
+    ],
+  }
+  const target = { id: 'l2', name: '目标库', tags: [], note: '', mode: 'sample', samples: [] }
+  const tree = runtime.mount(runtime.React.createElement(rtProbe.Editor, {
+    gameId: 'g1', ui, tags: [], libraries: [source, target], library: source,
+    onClose: () => {}, onChanged: () => {},
+  }))
+  await runtime.settle()
+
+  byText(tree, '整理')[0].props.onClick()
+  await runtime.settle()
+  const boxes = findAll(tree, node => node.type === 'input' && node.props.type === 'checkbox')
+  assert.equal(boxes.length, 3, '整理模式里每段一个勾选框')
+  boxes[0].props.onChange({ target: { checked: true } })
+  await runtime.settle()
+  assert.ok(JSON.stringify(tree).includes('已选 1 条'), '没显示已选条数')
+
+  const select = findAll(tree, node => node.props && node.props['aria-label'] === '移动到哪个库')[0]
+  assert.ok(select, '没有选目标库的下拉')
+  select.props.onChange({ target: { value: 'l2' } })
+  await runtime.settle()
+
+  byText(tree, '移动')[0].props.onClick()
+  await runtime.settle()
+  assert.equal(calls.length, 1)
+  assert.deepEqual(calls[0], { libraryId: 'l1', toLibraryId: 'l2', sampleIds: ['s1'] },
+    '应该把源库、目标库和勾中的 id 一起传过去')
+})
+
 console.log('\n结果：' + pass + ' 通过，' + fails.length + ' 失败\n')
 if (fails.length) {
   for (const item of fails) console.log(item.name + '\n' + (item.error?.stack || item.error))

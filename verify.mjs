@@ -76,17 +76,17 @@ console.log('\n== 基本接线 ==')
 const env = makeEnv(null)
 plugin.apply(env.ctx)
 
-await check('注册了 9 个 Agent 工具', () => {
+await check('注册了 10 个 Agent 工具', () => {
   const names = env.registered.map(item => item.name).sort()
   assert.deepEqual(names, [
     'style_card_get', 'style_card_save',
     'style_library_list', 'style_library_pick', 'style_library_save', 'style_library_split',
-    'style_sample_save', 'style_sample_save_many', 'style_tags_update',
+    'style_sample_move', 'style_sample_save', 'style_sample_save_many', 'style_tags_update',
   ])
 })
 
 await check('工具限定在卡片工作台', () => {
-  assert.equal(env.modeCalls.length, 9)
+  assert.equal(env.modeCalls.length, 10)
   for (const call of env.modeCalls) assert.deepEqual(call.modes, ['card'])
 })
 
@@ -836,6 +836,94 @@ await check('pick 工具支持一次选多个库', async () => {
   assert.deepEqual(multiEnv.gameStore.get('g-multi').libraryIds, [libA.id, libB.id])
 })
 
+console.log('\n== 移动摘录（拆库不用手删）==')
+
+const moveEnv = makeEnv(null)
+plugin.apply(moveEnv.ctx)
+
+await check('把几条摘录移到另一个库，源库同时删掉', async () => {
+  const a = await moveEnv.call('save-library', { library: { name: '源库', tags: ['冷峻'] } })
+  const b = await moveEnv.call('save-library', { library: { name: '目标库', tags: ['留白'] } })
+  for (let index = 1; index <= 3; index += 1) {
+    await moveEnv.call('save-sample', {
+      libraryId: a.id,
+      sample: { text: '第' + index + '条。' + '用来把这一段撑到有意义的长度。'.repeat(3), tags: ['冷峻'], source: 'S' + index },
+    })
+  }
+  const before = (await moveEnv.call('list')).data.libraries.find(item => item.id === a.id)
+  const ids = [before.samples[0].id, before.samples[2].id]
+
+  const out = await moveEnv.call('move-samples', { fromLibraryId: a.id, toLibraryId: b.id, sampleIds: ids })
+  assert.equal(out.moved, 2)
+  assert.equal(out.skipped, 0)
+
+  const after = (await moveEnv.call('list')).data.libraries
+  assert.equal(after.find(item => item.id === a.id).samples.length, 1, '源库应该只剩一条')
+  const target = after.find(item => item.id === b.id)
+  assert.deepEqual(target.samples.map(item => item.source), ['S1', 'S3'], '顺序和内容都要跟着走')
+  assert.deepEqual(target.samples[0].tags, ['冷峻'], '标签要保留')
+})
+
+await check('目标库满了只移装得下的，其余跳过', async () => {
+  const a = await moveEnv.call('save-library', { library: { name: '大源库' } })
+  const b = await moveEnv.call('save-library', { library: { name: '满库' } })
+  for (let index = 1; index <= 3; index += 1) {
+    await moveEnv.call('save-sample', {
+      libraryId: a.id, sample: { text: '待移动第' + index + '条。' + '内容内容内容内容内容'.repeat(3) },
+    })
+  }
+  // 把目标库填到 39 条，只剩一个位置
+  const filler = Array.from({ length: 39 }, (_, index) => ({ text: '占位第' + index + '条。' + '内容内容内容内容'.repeat(3) }))
+  const many = moveEnv.registered.find(item => item.name === 'style_sample_save_many')
+  await many.execute({ library: '满库', samples: filler })
+
+  const source = (await moveEnv.call('list')).data.libraries.find(item => item.id === a.id)
+  const out = await moveEnv.call('move-samples', {
+    fromLibraryId: a.id, toLibraryId: b.id, sampleIds: source.samples.map(item => item.id),
+  })
+  assert.equal(out.moved, 1, '只剩一个位置')
+  assert.equal(out.skipped, 2)
+})
+
+await check('源库和目标库相同时明确拒绝', async () => {
+  const lib = await moveEnv.call('save-library', { library: { name: '单库' } })
+  await moveEnv.call('save-sample', { libraryId: lib.id, sample: { text: '一条摘录。' + '内容内容内容内容'.repeat(3) } })
+  const list = (await moveEnv.call('list')).data.libraries.find(item => item.id === lib.id)
+  await assert.rejects(
+    () => moveEnv.call('move-samples', {
+      fromLibraryId: lib.id, toLibraryId: lib.id, sampleIds: [list.samples[0].id],
+    }),
+    /同一个/,
+  )
+})
+
+await check('批量删一次删掉多条', async () => {
+  const lib = await moveEnv.call('save-library', { library: { name: '待清理库' } })
+  for (let index = 1; index <= 4; index += 1) {
+    await moveEnv.call('save-sample', { libraryId: lib.id, sample: { text: '清理第' + index + '条。' + '内容内容内容内容'.repeat(3) } })
+  }
+  const before = (await moveEnv.call('list')).data.libraries.find(item => item.id === lib.id)
+  const out = await moveEnv.call('delete-samples', {
+    libraryId: lib.id, sampleIds: [before.samples[0].id, before.samples[1].id, before.samples[3].id],
+  })
+  assert.equal(out.removed, 3)
+  const after = (await moveEnv.call('list')).data.libraries.find(item => item.id === lib.id)
+  assert.equal(after.samples.length, 1)
+})
+
+await check('style_sample_move 工具能按库名移动', async () => {
+  const lib = await moveEnv.call('save-library', { library: { name: '工具源' } })
+  const target = await moveEnv.call('save-library', { library: { name: '工具目标' } })
+  await moveEnv.call('save-sample', { libraryId: lib.id, sample: { text: '工具移动用的一条。' + '内容内容内容内容'.repeat(3) } })
+  const list = (await moveEnv.call('list')).data.libraries.find(item => item.id === lib.id)
+  const move = moveEnv.registered.find(item => item.name === 'style_sample_move')
+  const out = await move.execute({ from: '工具源', to: '工具目标', ids: [list.samples[0].id] })
+  assert.equal(out.moved, 1)
+  assert.ok(out.text.includes('工具目标'))
+  const after = (await moveEnv.call('list')).data.libraries
+  assert.equal(after.find(item => item.id === target.id).samples.length, 1)
+})
+
 console.log('\n== 子作用域兼容（Cordis 给的是 childContext）==')
 
 await check('只有 ctx.get 时也能拿到 tavern 和 tools', async () => {
@@ -850,7 +938,7 @@ await check('只有 ctx.get 时也能拿到 tavern 和 tools', async () => {
     effect: fn => fn(),
   }
   plugin.apply(childCtx, {})
-  assert.equal(registered.length, 9, '应注册 9 个工具，实际 ' + registered.length)
+  assert.equal(registered.length, 10, '应注册 10 个工具，实际 ' + registered.length)
 })
 
 console.log('\n== 风格卡（7+1 维度提炼）==')

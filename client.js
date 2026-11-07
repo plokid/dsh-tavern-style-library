@@ -600,7 +600,7 @@ window.__ModuleLoader__.load({
 
     // ── 样文库编辑（弹层）────────────────────────────────────────────
 
-    function Editor({ gameId, ui, tags, library, onClose, onChanged }) {
+    function Editor({ gameId, ui, tags, libraries, library, onClose, onChanged }) {
       const empty = { id: '', name: '', tags: [], note: '', samples: [], mode: 'sample', card: null }
       const [draft, setDraft] = useState(() => ({ ...empty, ...(library || {}) }))
       const [tagPool, setTagPool] = useState(tags || [])
@@ -613,6 +613,10 @@ window.__ModuleLoader__.load({
       const [error, setError] = useState('')
       // 正在问「确定删这一段吗」的那一条的 id，空表示没有
       const [deleting, setDeleting] = useState('')
+      // 整理模式：勾几条一起移动/删除。拆库时不用一条一条点。
+      const [selecting, setSelecting] = useState(false)
+      const [picked, setPicked] = useState([])
+      const [moveTo, setMoveTo] = useState('')
 
       const patch = changes => setDraft(current => ({ ...current, ...changes }))
 
@@ -722,9 +726,35 @@ window.__ModuleLoader__.load({
         } catch (error) { setError(message(error)) } finally { setBusy(false) }
       }
 
-      const analyze = async () => {
-        if (!sample.text.trim()) { setError('先粘贴一段样文'); return }
+      // ── 整理：勾选的几条一起移动或删除 ──
+      const togglePick = id => setPicked(list => (list.includes(id) ? list.filter(item => item !== id) : [...list, id]))
+
+      const applyBulk = async (action, payload, done) => {
         setBusy(true); setError('')
+        try {
+          const result = await call(ui, action, { libraryId: draft.id, ...payload })
+          const fresh = (result.data.libraries || []).find(item => item.id === draft.id)
+          if (fresh) setDraft(fresh)
+          if (onChanged) onChanged(result.data)
+          setPicked([])
+          setMoveTo('')
+          if (done) done(result)
+        } catch (error) { setError(message(error)) } finally { setBusy(false) }
+      }
+
+      const movePicked = () => {
+        if (!moveTo) { setError('先选要移到哪个库'); return }
+        applyBulk('move-samples', { toLibraryId: moveTo, sampleIds: picked },
+          () => { setSelecting(false); setError('') })
+      }
+
+      const deletePicked = () => applyBulk(
+        'delete-samples', { sampleIds: picked },
+        () => { setSelecting(false) },
+      )
+
+      const analyze = async () => {
+        if (!sample.text.trim()) { setError('先粘贴一段样文'); return }        setBusy(true); setError('')
         try {
           const result = await call(ui, 'analyze', { gameId, text: sample.text, tags: tagPool })
           setSample(current => ({ ...current, tags: result.tags }))
@@ -864,6 +894,12 @@ window.__ModuleLoader__.load({
               h('div', { className: 'dsl-section-title', style: { flex: 1 } },
                 '样文（' + (draft.samples || []).length + ' 条）'),
               h('span', { className: 'dsl-hint' }, '单条最多 ' + MAX_SAMPLE_CHARS + ' 字'),
+              (draft.samples || []).length
+                ? h(Button, {
+                  small: true,
+                  onClick: () => { setSelecting(value => !value); setPicked([]); setError('') },
+                }, selecting ? '完成' : '整理')
+                : null,
             ),
           ),
           (draft.samples || []).map((item, index) => {
@@ -872,8 +908,9 @@ window.__ModuleLoader__.load({
             const editing = sample.id === item.id
             // 删除也走就地确认：第一次点只是把这一条换成确认条，点完确认才真删。
             const asking = deleting === item.id
+            const checked = picked.includes(item.id)
             return h('div', {
-              key: item.id, className: cx('dsl-item', (editing || asking) && 'is-editing'),
+              key: item.id, className: cx('dsl-item', (editing || asking || (selecting && checked)) && 'is-editing'),
               // startEdit 靠这个属性把展开后的卡片滚进视野
               'data-editing-sample': editing ? item.id : undefined,
               // 确认条靠这个属性把自己滚进视野（和编辑用同一套 scrollIntoViewOn）
@@ -888,19 +925,26 @@ window.__ModuleLoader__.load({
                     + (item.tags.length ? ' · ' + item.tags.join('／') : '')
                     + ' · ' + item.text.length + ' 字'),
                 ),
-                asking
-                  ? null
-                  : h('div', { className: 'dsl-actions is-tight' },
-                    // 再点一次收起，一次误触不用往下找取消
-                    h(Button, {
-                      small: true, primary: editing,
-                      onClick: () => editing ? resetSample() : startEdit(item),
-                    }, editing ? '收起' : '编辑'),
-                    h(Button, {
-                      small: true, danger: true, disabled: busy,
-                      onClick: () => askDelete(item),
-                    }, '删除'),
-                  ),
+                selecting
+                  ? h('label', { className: 'dsl-check' },
+                    h('input', {
+                      type: 'checkbox', checked, 'aria-label': '选中第 ' + (index + 1) + ' 段',
+                      onChange: () => togglePick(item.id),
+                    }),
+                    h('span', null, checked ? '已选' : '选中'))
+                  : asking
+                    ? null
+                    : h('div', { className: 'dsl-actions is-tight' },
+                      // 再点一次收起，一次误触不用往下找取消
+                      h(Button, {
+                        small: true, primary: editing,
+                        onClick: () => editing ? resetSample() : startEdit(item),
+                      }, editing ? '收起' : '编辑'),
+                      h(Button, {
+                        small: true, danger: true, disabled: busy,
+                        onClick: () => askDelete(item),
+                      }, '删除'),
+                    ),
               ),
 
               asking
@@ -946,6 +990,44 @@ window.__ModuleLoader__.load({
                     item.text.length > 180 ? item.text.slice(0, 180) + '…' : item.text),
             )
           }),
+
+          // 整理模式的操作条：勾几条一起移动（拆库）或删除
+          selecting
+            ? h('div', { className: 'dsl-section' },
+              h('p', { className: 'dsl-hint' },
+                '勾上要处理的段落：「移动」会把它们从本库移到另一个库（拆库就用它，不用再回来一条条删），'
+                + '「删除选中」是一次删掉。'),
+              h('div', { className: 'dsl-actions' },
+                h('span', { className: 'dsl-hint', style: { flex: 1 } }, '已选 ' + picked.length + ' 条'),
+                h('select', {
+                  className: 'dsl-select', style: { flex: '1 1 140px' }, value: moveTo,
+                  'aria-label': '移动到哪个库',
+                  onChange: event => setMoveTo(event.target.value),
+                },
+                [h('option', { key: '', value: '' }, '移到…')].concat(
+                  (libraries || [])
+                    .filter(item => item.id !== draft.id)
+                    .map(item => h('option', { key: item.id, value: item.id }, item.name)),
+                ),
+                ),
+                h(Button, {
+                  small: true, primary: true, disabled: busy || picked.length === 0 || !moveTo,
+                  onClick: movePicked,
+                }, busy ? '处理中…' : '移动'),
+                h(Button, {
+                  small: true, danger: true, solid: true, disabled: busy || picked.length === 0,
+                  onClick: deletePicked,
+                }, '删除选中'),
+                h(Button, {
+                  small: true, disabled: busy,
+                  onClick: () => { setSelecting(false); setPicked([]); setMoveTo('') },
+                }, '取消'),
+              ),
+              (libraries || []).filter(item => item.id !== draft.id).length === 0
+                ? h('p', { className: 'dsl-hint' }, '还没有别的库可移——先回列表页「新建」，再回来移动。')
+                : null,
+            )
+            : null,
         ) : h('section', { className: 'dsh-tavern-settings-group' },
           h('div', { className: 'dsl-section' },
             h('p', { className: 'dsl-hint' }, '先点上面的「创建」，再回来添加样文。'),
@@ -1364,7 +1446,7 @@ window.__ModuleLoader__.load({
       // 编辑页
       if (view === 'edit') {
         return h(Editor, {
-          gameId, ui, tags: (data && data.tags) || [], library: editing,
+          gameId, ui, tags: (data && data.tags) || [], libraries, library: editing,
           onClose: closeEditor,
           onChanged: () => { refresh() },
         })
