@@ -458,11 +458,14 @@ await check('风格卡：编辑页有提炼入口和注入方式开关', () => {
   assert.equal((labels.match(/\['[a-z]+', '/g) || []).length, 9, '维度标签不是九个')
 })
 
-await check('风格卡：清除卡走二次确认', () => {
+await check('风格卡：清除和重新提炼都走二次确认', () => {
   const part = source.slice(source.indexOf('function StyleCardBlock'), source.indexOf('// ── 样文库编辑'))
-  assert.ok(/setConfirming\(true\)/.test(part), '清除没有二次确认')
-  assert.ok(/h\(ConfirmBar/.test(part), '清除没有用确认条')
-  assert.ok(/不可恢复/.test(part), '确认里没说清后果')
+  assert.ok(/setConfirming\('clear'\)/.test(part), '清除没有二次确认')
+  // 重新提炼会调一次模型并覆盖现有卡，也不该点一下就发生
+  assert.ok(/setConfirming\('distill'\)/.test(part), '重新提炼没有二次确认')
+  assert.ok(/h\(ConfirmBar/.test(part), '没有用确认条')
+  assert.ok(/不可恢复/.test(part), '清除的确认里没说清后果')
+  assert.ok(/上一版/.test(part), '提炼的确认里没说旧卡会留着')
 })
 
 await check('只用风格卡时不显示「换一段」', () => {

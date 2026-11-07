@@ -360,7 +360,8 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState('')
       const [error, setError] = useState('')
       const [notice, setNotice] = useState('')
-      const [confirming, setConfirming] = useState(false)
+      // '' | 'clear' | 'distill' —— 确认条有三种状态，用一个字段表示
+      const [confirming, setConfirming] = useState('')
       const [prompt, setPrompt] = useState('')
       // 试写结果只活在这个组件里：模型按卡写的一段字，看完就没必要留住，
       // 存进卡只会让它变大、并让「改卡→再试」越试越挤。
@@ -394,8 +395,13 @@ window.__ModuleLoader__.load({
         setPrompt(String((result && result.text) || ''))
       })
 
+      const restore = () => run('restore', 'card-restore', { libraryId }, result => {
+        if (result && result.card) onChanged(result.card)
+        setNotice('已恢复上一版。再点一次可以换回来。')
+      })
+
       const clear = () => run('clear', 'card-clear', { libraryId }, () => {
-        setConfirming(false)
+        setConfirming('')
         setPrompt('')
         setSample(null)
         // 宿主把 mode 一并改回 sample 了，界面上也要跟着回，否则下拉显示的和服务端存的对不上。
@@ -551,26 +557,40 @@ window.__ModuleLoader__.load({
             )
             : null,
 
-          confirming
+          confirming === 'clear'
             ? h(ConfirmBar, {
               busy: busy === 'clear',
               confirmLabel: '确认清除风格卡',
-              text: '清除后这个库回到只用摘录，卡里的维度观察、铁律、禁用清单都会丢掉，不可恢复。',
+              text: '清除后这个库回到只用摘录，卡里的维度观察、铁律、禁用清单都会丢掉，不可恢复。'
+                + '（想留着就先用「导出 Prompt」存一份。）',
               onConfirm: clear,
-              onCancel: () => setConfirming(false),
+              onCancel: () => setConfirming(''),
             })
-            : h('div', { className: 'dsl-actions' },
-              // 卡是模型按材料写的，对不对得用户自己看——看出来了就要能改，
-              // 否则只能整张重新提炼，碰运气。
-              h(Button, { small: true, disabled: Boolean(busy), onClick: () => { setEditing(true); setNotice('') } }, '编辑'),
-              h(Button, { small: true, disabled: Boolean(busy), onClick: distill },
-                busy === 'distill' ? '提炼中…' : '重新提炼'),
-              h(Button, { small: true, disabled: Boolean(busy) || !gameId, onClick: test },
-                busy === 'test' ? '试写中…' : '试写一段'),
-              h(Button, { small: true, disabled: Boolean(busy), onClick: exportPrompt },
-                busy === 'export' ? '整理中…' : '导出 Prompt'),
-              h(Button, { small: true, danger: true, disabled: Boolean(busy), onClick: () => setConfirming(true) }, '清除'),
-            ),
+            : confirming === 'distill'
+              ? h(ConfirmBar, {
+                busy: busy === 'distill',
+                confirmLabel: '确认重新提炼',
+                text: '会再调一次后台模型，用新结果替换现在这张卡。'
+                  + '旧的会留成「上一版」，之后可以恢复。',
+                onConfirm: () => { setConfirming(''); distill() },
+                onCancel: () => setConfirming(''),
+              })
+              : h('div', { className: 'dsl-actions' },
+                // 卡是模型按材料写的，对不对得用户自己看——看出来了就要能改，
+                // 否则只能整张重新提炼，碰运气。
+                h(Button, { small: true, disabled: Boolean(busy), onClick: () => { setEditing(true); setNotice('') } }, '编辑'),
+                h(Button, { small: true, disabled: Boolean(busy), onClick: () => setConfirming('distill') },
+                  busy === 'distill' ? '提炼中…' : '重新提炼'),
+                h(Button, { small: true, disabled: Boolean(busy) || !gameId, onClick: test },
+                  busy === 'test' ? '试写中…' : '试写一段'),
+                h(Button, { small: true, disabled: Boolean(busy), onClick: exportPrompt },
+                  busy === 'export' ? '整理中…' : '导出 Prompt'),
+                card.previous
+                  ? h(Button, { small: true, disabled: Boolean(busy), onClick: restore },
+                    busy === 'restore' ? '恢复中…' : '恢复上一版')
+                  : null,
+                h(Button, { small: true, danger: true, disabled: Boolean(busy), onClick: () => setConfirming('clear') }, '清除'),
+              ),
 
           notice ? h('p', { className: 'dsl-hint' }, notice) : null,
           error ? h('p', { className: 'dsl-error' }, error) : null,

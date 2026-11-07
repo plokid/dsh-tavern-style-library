@@ -1109,6 +1109,57 @@ await check('卡能穿过来回存读（重新载入后仍在）', async () => {
   assert.ok(Object.keys(found.card.dimensions).length >= 5)
 })
 
+console.log('\n== 上一版与回退 ==')
+
+await check('重新存卡会留上一版，能来回恢复', async () => {
+  const lib = await cardEnv.call('save-library', { library: { name: '版本库' } })
+  await cardEnv.call('card-save', { libraryId: lib.id, card: rawCard })
+  const changed = { ...rawCard, dimensions: { lexical: ['改过的词汇观察'] }, laws: ['只剩一条铁律'] }
+  const second = await cardEnv.call('card-save', { libraryId: lib.id, card: changed })
+  assert.ok(second.card.previous, '覆盖时应该留下上一版')
+  assert.deepEqual(second.card.previous.dimensions.lexical,
+    ['多用单音节动词，如「落」「沉」「贴」', '几乎没有形容词堆叠'], '上一版应是原来那张')
+
+  const back = await cardEnv.call('card-restore', { libraryId: lib.id })
+  assert.deepEqual(back.card.dimensions.lexical,
+    ['多用单音节动词，如「落」「沉」「贴」', '几乎没有形容词堆叠'], '恢复后应回到旧卡')
+  assert.deepEqual(back.card.laws, rawCard.laws)
+
+  // 恢复之后刚才那张成了「上一版」，再点一次能换回去
+  const again = await cardEnv.call('card-restore', { libraryId: lib.id })
+  assert.deepEqual(again.card.dimensions.lexical, ['改过的词汇观察'], '再恢复一次应换回新卡')
+})
+
+await check('内容没变的重复保存不会挤掉上一版', async () => {
+  const lib = await cardEnv.call('save-library', { library: { name: '重复保存库' } })
+  await cardEnv.call('card-save', { libraryId: lib.id, card: rawCard })
+  await cardEnv.call('card-save', { libraryId: lib.id, card: { ...rawCard, laws: ['改过'] } })
+  const before = cardEnv.store.libraries.find(item => item.id === lib.id).card
+  assert.ok(before.previous, '前提：应该已经有上一版')
+  // 再存一模一样的内容
+  await cardEnv.call('card-save', { libraryId: lib.id, card: { ...rawCard, laws: ['改过'] } })
+  const after = cardEnv.store.libraries.find(item => item.id === lib.id).card
+  assert.deepEqual(after.previous.laws, rawCard.laws, '上一版不该被同内容覆盖掉')
+})
+
+await check('试写改分数不算一次新版本', async () => {
+  const lib = await cardEnv.call('save-library', { library: { name: '试写版本库' } })
+  await cardEnv.call('card-save', { libraryId: lib.id, card: rawCard })
+  await cardEnv.call('card-save', { libraryId: lib.id, card: { ...rawCard, laws: ['新的一条'] } })
+  const before = cardEnv.store.libraries.find(item => item.id === lib.id).card
+  cardEnv.tavern.runTask = async () => ({ text: '【试写】\n雪停了。\n【自评】\n综合匹配度：66%' })
+  await cardEnv.call('card-test', { gameId: 'c-ver', libraryId: lib.id })
+  const after = cardEnv.store.libraries.find(item => item.id === lib.id).card
+  assert.equal(after.match, 66)
+  assert.deepEqual(after.previous, before.previous, '试写不该动上一版')
+})
+
+await check('没有上一版时恢复给出提示', async () => {
+  const lib = await cardEnv.call('save-library', { library: { name: '无版本库' } })
+  await cardEnv.call('card-save', { libraryId: lib.id, card: rawCard })
+  await assert.rejects(() => cardEnv.call('card-restore', { libraryId: lib.id }), /没有上一版/)
+})
+
 console.log('\n结果：' + pass + ' 通过，' + fails.length + ' 失败\n')
 if (fails.length) {
   for (const item of fails) console.log(item.name + '\n' + (item.error?.stack || item.error))

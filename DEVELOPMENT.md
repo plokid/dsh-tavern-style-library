@@ -72,8 +72,15 @@ node smoke-client.mjs  # 浏览器侧：模块加载、注册调用、布局与�
   disallowed: [...],                          // 从不出现 ≤ 10
   aiBan: [...],                               // AI 腔词表 ≤ 20
   mantra, formula, match, updatedAt,
+  previous: { ...同上，但自己不再带 previous },   // 上一版，只留一层
 }
 ```
+
+**`previous` 是「覆盖前的快照」，用来给「恢复上一版」兜底。** 三条规则：
+
+1. 只在内容真的变了时才写（`cardFingerprint()` 比较时抹掉 `updatedAt` 和 `previous`）——原样再存一次不该挤掉退路。
+2. `keepPrevious: false` 用于不算版本的写入：试写只改分数、以及「恢复上一版」自身（它要显式把自己塞进 `previous`，才能在两版之间来回）。
+3. 卡快顶到字节上限时先丢 `previous`，别让主内容存不进去——和「试写不落盘」是同一个取舍：附属信息让步于主体。
 
 三处要注意：
 

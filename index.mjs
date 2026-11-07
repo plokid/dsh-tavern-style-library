@@ -211,7 +211,8 @@ function cardGenes(value) {
   return out
 }
 
-function normalizeCard(raw) {
+// withPrevious=false 用来掐断递归：上一版自己不再带上一版，只留一层。
+function normalizeCard(raw, withPrevious = true) {
   const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null
   if (!src) return null
   const corpusRaw = src.corpus && typeof src.corpus === 'object' ? src.corpus : {}
@@ -242,6 +243,8 @@ function normalizeCard(raw) {
     mantra: squeeze(src.mantra ?? src['口诀'] ?? src['起笔口诀'] ?? '', MAX_CARD_MANTRA),
     formula: squeeze(src.formula ?? src['公式'] ?? '', 60),
     match: clampInt(src.match ?? src.score ?? src['匹配度'], 0, 100),
+    // 上一版：重新提炼/手改/导入时由 writeCard 自动塞进来，给「恢复上一版」用。
+    previous: withPrevious && src.previous ? normalizeCard(src.previous, false) : null,
     updatedAt: Number(src.updatedAt) || Date.now(),
   }
   // 一张什么实质内容都没有的卡等于没有卡——不要拿它去注入。
@@ -1119,24 +1122,43 @@ export function apply(ctx, config = {}) {
   // ── 风格卡的读写 ────────────────────────────────────────────
   // 卡是整库一份，跟库一起存（plugin-data 里），不进按局数据：
   // 换一局、回退到哪一轮，用的都是同一张卡，不需要按版本管理。
-  async function writeCard(libraryId, rawCard) {
+  // 覆盖一张卡前，把旧的那张留成 previous：
+  // 重新提炼是「再问一次模型」，这次没读全就得能退回上一次，否则只能反复碰运气。
+  // keepPrevious=false 用于改分数这类不算版本的写入（试写）和「恢复上一版」自身。
+  async function writeCard(libraryId, rawCard, options = {}) {
     const card = normalizeCard(rawCard)
     if (!card) {
       throw new Error('风格卡是空的：至少要给出维度观察、写作基因、铁律、禁用清单里的任意一项')
-    }
-    const bytes = cardBytes(card)
-    if (bytes > MAX_CARD_BYTES) {
-      throw new Error('风格卡太长（' + Math.round(bytes / 1024) + ' KB，上限 '
-        + Math.round(MAX_CARD_BYTES / 1024) + ' KB）：删掉几条再存')
     }
     const data = await load()
     const next = { ...data, libraries: cloneLibraries(data) }
     const library = next.libraries.find(item => item.id === str(libraryId))
     if (!library) throw new Error('没有这个样文库')
+
+    if (options.keepPrevious !== false && hasCard(library.card)) {
+      // 内容没变就沿用原来那版上一版——否则「原样再存一次」会把上一版冲成空，
+      // 用户什么都没改，却丢了退路。
+      card.previous = cardFingerprint(library.card) === cardFingerprint(card)
+        ? (library.card.previous ? normalizeCard(library.card.previous, false) : null)
+        : normalizeCard(library.card, false)
+    }
+    // 上一版是「以防万一」的东西，卡本身快满时先丢它，别让主内容存不进去。
+    if (card.previous && cardBytes(card) > MAX_CARD_BYTES) card.previous = null
+
+    const bytes = cardBytes(card)
+    if (bytes > MAX_CARD_BYTES) {
+      throw new Error('风格卡太长（' + Math.round(bytes / 1024) + ' KB，上限 '
+        + Math.round(MAX_CARD_BYTES / 1024) + ' KB）：删掉几条再存')
+    }
     library.card = card
     library.updatedAt = Date.now()
     const saved = await persist(next)
     return { data: saved, card }
+  }
+
+  // 只比内容，不比时间戳和上一版——否则每次保存都算「变过」，都会挤掉真正的上一版。
+  function cardFingerprint(card) {
+    return JSON.stringify({ ...normalizeCard(card, false), previous: null, updatedAt: 0 })
   }
 
   async function clearCard(libraryId) {
@@ -1384,6 +1406,21 @@ export function apply(ctx, config = {}) {
     return await clearCard(library.id)
   })
 
+  // 恢复上一版：把当前这张换回 previous。
+  // 恢复之后「上一版」变成刚才那张，所以连着点两次会在两版之间来回，不会丢东西。
+  handle('card-restore', async ({ libraryId } = {}) => {
+    const data = await load()
+    const library = libraryOf(data, libraryId)
+    const previous = library.card && library.card.previous
+    if (!hasCard(previous)) throw new Error('这个库没有上一版可以恢复')
+    const out = await writeCard(
+      library.id,
+      { ...previous, previous: normalizeCard(library.card, false) },
+      { keepPrevious: false },
+    )
+    return { data: out.data, card: out.card, libraryId: library.id }
+  })
+
   // 用本局后台模型把整库摘录提炼成一张卡。素材只取库里的摘录——
   // 素材库里用户引用的原始材料插件读不到（那是 Tavern 的内部目录）。
   handle('card-distill', async ({ gameId, libraryId } = {}) => {
@@ -1413,10 +1450,11 @@ export function apply(ctx, config = {}) {
     const out = parseTestReply(reply)
     if (!out.text) throw new Error('模型没有给出试写内容：' + str(reply).slice(0, 160))
     // 只把分数写进卡；试写正文随返回值给面板显示，不落盘。
+    // keepPrevious:false —— 改个分数不算一次「重新提炼」，不该占用上一版的位置。
     const saved = await writeCard(library.id, {
       ...library.card,
       match: out.match || library.card.match,
-    })
+    }, { keepPrevious: false })
     return { data: saved.data, card: saved.card, text: out.text, match: out.match, libraryId: library.id }
   })
 
