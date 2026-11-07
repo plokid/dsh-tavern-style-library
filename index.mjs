@@ -48,7 +48,7 @@ const MARKER = /#文风\s*[:：]?\s*([^\s#，,。;；!！?？、]+)/u
 // ── 风格卡（7+1 维度提炼）────────────────────────────────────────
 //
 // 融合 perfectly-replicate-writing-skills 的分析框架（MIT，见
-// skills/distill-style-library/references/framework.md）：把一整个库的摘录
+// skills/style-library/references/framework.md）：把一整个库的摘录
 // 提炼成一张「可执行的风格卡」——七个维度的量化观察、跨维度验证过的写作基因、
 // 铁律、以及「从不出现」的禁用清单。摘录是原文证据，风格卡是规则；两者一起
 // 注入，模型既有样子可看，也有边界可守。
@@ -1476,7 +1476,7 @@ export function apply(ctx, config = {}) {
     add({
       name: 'style_library_save',
       description: '新建一个样文库，或改已有库的名称、笔调标签与注入方式。建库本身不存样文，存摘录用 style_sample_save_many；'
-        + '攒够摘录后可以用 style_card_save 存一张风格卡（见 distill-style-library Skill）。',
+        + '攒够摘录后可以用 style_card_save 存一张风格卡（见 style-library Skill）。',
       parameters: {
         type: 'object', additionalProperties: false, required: ['name'],
         properties: {
@@ -1644,7 +1644,7 @@ export function apply(ctx, config = {}) {
     })
 
     // ── 风格卡工具 ────────────────────────────────────────────
-    // 分析框架在 distill-style-library Skill 里：Agent 读完材料按 9 个维度分析，
+    // 分析框架在 style-library Skill 里：Agent 读完材料按 9 个维度分析，
     // 再把结果按这里的形状存进来。存进来的东西会跟摘录一起注入正文。
     add({
       name: 'style_card_save',
@@ -1787,7 +1787,7 @@ export function apply(ctx, config = {}) {
   if (typeof ctx.effect === 'function') ctx.effect(() => registerTools())
   else registerTools()
 
-  // 自带的建库 Skill：写法同 create-writing-skill，卡片工作台里按场景加载。
+  // 自带的 Skill：建库 + 提炼卡是同一个流程，放在一个 SKILL.md 里。
   if (typeof tavern.skillSource === 'function') {
     try {
       const dir = fileURLToPath(new URL('./skills', import.meta.url))

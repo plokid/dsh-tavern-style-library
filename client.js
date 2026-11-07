@@ -305,7 +305,7 @@ window.__ModuleLoader__.load({
               + '摘录告诉模型「长这样」，卡告诉它「必须这样、绝不那样」。'),
             h('p', { className: 'dsl-hint' },
               '用本局后台模型提炼，会产生一次调用；也可以用卡片工作台里的 Agent（说「把这个库提炼成风格卡」），'
-              + '它会按 distill-style-library 的流程分析。'),
+              + '它会按 style-library 的流程分析。'),
             h('div', { className: 'dsl-actions' },
               h(Button, { primary: true, disabled: busy || !libraryId, onClick: distill },
                 busy === 'distill' ? '提炼中…' : 'AI 提炼风格卡'),
@@ -1444,7 +1444,10 @@ window.__ModuleLoader__.load({
                       busy,
                       confirmLabel: '确认删除这个库',
                       text: '删除「' + library.name + '」会一并删掉里面 '
-                        + count + ' 段样文，不可恢复。'
+                        + count + ' 段样文'
+                        // 卡是花一次模型调用提炼出来的，删库时它跟着一起没，必须说清楚
+                        + (library.card ? '和那张风格卡' : '')
+                        + '，不可恢复。'
                         + (on ? '这一局正在用它，删掉后会取消文风。' : ''),
                       onConfirm: () => { setPendingDelete(null); remove(library) },
                       onCancel: () => setPendingDelete(null),

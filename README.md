@@ -85,7 +85,7 @@
 
 **面板上：** 打开库 → 「AI 提炼风格卡」。用本局的后台模型跑一次，结果存进库里。
 
-**让 Agent 做：** 在卡片工作台说「把『冷峻武侠』这个库提炼成风格卡」。它会按 `distill-style-library` 这个 Skill 的流程分析，再调 `style_card_save` 存进来。分析框架和阈值在 `skills/distill-style-library/references/` 里。
+**让 Agent 做：** 在卡片工作台说「把『冷峻武侠』这个库提炼成风格卡」。它会按 `style-library` 这个 Skill 的流程分析，再调 `style_card_save` 存进来。同一个 Skill 也负责建库——说「用这本书建一个库」时它走的是同一条流程的前半段。分析框架和阈值在 `skills/style-library/references/` 里。
 
 两条路都可以反复跑。**有旧卡再做一次是覆盖**，所以想保留手改的内容，就让 Agent 走增量修订（它会先 `style_card_get` 看一眼旧卡）。
 
@@ -144,12 +144,15 @@ mv /tmp/dsh-tavern-style-library-main "$DSH_HOME/profile-data/tavern/data/plugin
 - **从长文切段**：把一整章粘进去，选每段字数，「切段」→ 勾选要留的 →「存入」。可以逐段或整批「AI 打标签」。
 - **单条添加**：粘一小段，手动选标签，「保存样文」。
 
-**整本、批量交给 Agent**——和创建 Skill 是同一个流程：
+**整本、批量交给 Agent**——一次对话走完：
 
 1. 在「剧本与素材库」引用要用的材料。
 2. 到卡片工作台跟 Agent 说：「用我引用的这本书建一个样文库，叫『冷峻武侠』」。
 3. Agent 会先拟一批笔调标签，列出来等确认；增删改之后，它才切段和打标签。
-4. 存档完成后，面板中即可看到；游玩时选中它生效。
+4. 存档完成后它会问一句「要不要现在提炼风格卡」。要，就接着做；不要，就是个只有摘录的库，之后随时能补。
+5. 提炼完它会问注入方式（摘录 / 摘录＋卡 / 只用卡），选完存好，游玩时选中它生效。
+
+建库和提炼是同一个 Skill（`style-library`）的两段，不用记两个名字。
 
 ### 开一局用上它
 
@@ -198,7 +201,7 @@ mv /tmp/dsh-tavern-style-library-main "$DSH_HOME/profile-data/tavern/data/plugin
 
 | 情况 | 先检查什么 |
 | --- | --- |
-| 状态页没有「下一轮样文笔调」 | 这一局还没选库。没选库时整节不显示 |
+| 状态页那一节只显示提示、没有引文 | 这一局还没选库。提示下面有「去样文库选一段 →」，点进去选 |
 | 「换一段」没反应 | 库里是不是只有一段；只有一段时无法轮换，会给出提示。库设成「只用风格卡」时也不会显示这个按钮 |
 | 注入的内容没生效 | 本局是否点了「本局使用」；是否开着内置文风联想在抢位置（两者都给范文，会互相顶） |
 | 「AI 打标签」报错 | 这一局是否配置了后台模型。手动打标签不受影响 |
@@ -228,7 +231,7 @@ mv /tmp/dsh-tavern-style-library-main "$DSH_HOME/profile-data/tavern/data/plugin
 - 风格卡的分析框架来自 [perfectly-replicate-writing-skills](https://github.com/zrh091110225/perfectly-replicate-writing-skills)（MIT）：7+1 维度、3 次以上才算特征、保留矛盾、禁用清单优先这些「品味原则」直接沿用，阈值按中文小说重新校准。
 - 九个维度里的「感官」「对白」，可自检的铁律，以及 AI 腔词表，参考了 [magic-distillation](https://github.com/dama-cyber/magic-distillation) 的 `fiction-distiller`。它那套「换元仿写 + 反检测」的流水线没有搬进来——本插件只往玩家自己的剧情里注入参考，不生成新文本，那部分用不上。
 
-代码以 [MIT](LICENSE) 许可发布。两个参考项目的许可原文见 `skills/distill-style-library/references/framework.md` 末尾。
+代码以 [MIT](LICENSE) 许可发布。两个参考项目的许可原文见 `skills/style-library/references/framework.md` 末尾。
 
 ---
 

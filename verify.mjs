@@ -437,13 +437,26 @@ await check('tags_update 未知操作报错', async () => {
 
 // SKILL.md 里让 Agent 调的工具名必须真的注册过。
 // 之前 SKILL 写了 style_library_split，工具却不存在，Agent 调它只会失败。
+await check('只有一个 Skill，且目录名与 frontmatter 一致', () => {
+  const dir = fileURLToPath(new URL('./skills', import.meta.url))
+  const dirs = fs.readdirSync(dir, { withFileTypes: true }).filter(entry => entry.isDirectory())
+  // 建库和提炼卡是同一个流程的两段，拆成两个 Skill 会让 Agent 和用户都要多判一次
+  // 「现在该用哪个」。合并后只留一个，这条断言防止以后又被拆开。
+  assert.equal(dirs.length, 1, '只应有一个 Skill，实际：' + dirs.map(item => item.name).join(', '))
+  const file = path.join(dir, dirs[0].name, 'SKILL.md')
+  assert.ok(fs.existsSync(file), '缺少 SKILL.md')
+  const meta = fs.readFileSync(file, 'utf8').match(/^---\r?\n([\s\S]*?)\r?\n---/)
+  assert.ok(meta, 'SKILL.md 缺少 frontmatter')
+  const name = (meta[1].match(/^name:\s*(.+)$/m) || [])[1]
+  assert.equal(String(name).trim(), dirs[0].name, 'frontmatter 的 name 必须和目录名一致')
+})
+
 await check('SKILL.md 提到的工具都真实存在', () => {
   const dir = fileURLToPath(new URL('./skills', import.meta.url))
   const skills = fs.readdirSync(dir, { withFileTypes: true })
     .filter(entry => entry.isDirectory())
     .map(entry => path.join(dir, entry.name, 'SKILL.md'))
     .filter(file => fs.existsSync(file))
-  assert.ok(skills.length >= 2, '应有建库和提炼风格卡两个 Skill，实际 ' + skills.length)
   const registered = new Set(agentEnv.registered.map(item => item.name))
   const missing = []
   let mentioned = 0

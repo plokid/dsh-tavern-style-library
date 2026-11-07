@@ -9,8 +9,7 @@
 | `index.mjs` | 宿主侧：数据读写、轮换逻辑、注入、风格卡、Agent 工具、Skill 注册 |
 | `client.js` | 浏览器侧：侧栏面板、状态分节（`ctx.tavernUi`） |
 | `package.json` | 插件元信息，`name` 必须与浏览器侧返回的 `name` 一致 |
-| `skills/create-style-library/` | 建库用的 Agent Skill |
-| `skills/distill-style-library/` | 提炼风格卡用的 Agent Skill（含 `references/`：维度框架、叙事公式） |
+| `skills/style-library/` | Agent Skill：建库 + 提炼卡一条流程（含 `references/`：维度框架、叙事公式） |
 | `verify.mjs` | 宿主侧测试 |
 | `smoke-client.mjs` | 浏览器侧测试 |
 
@@ -87,7 +86,7 @@ node smoke-client.mjs  # 浏览器侧：模块加载、注册调用、布局与�
 | 入口 | 怎么来的 | 模型调用 |
 | --- | --- | --- |
 | `handle('card-distill')` | 面板「AI 提炼」，`distillPrompt()` 取库里最多 12 段（沿全文均匀取样，不是只取开头）、每段截 700 字 | 1 次 |
-| `style_card_save` 工具 | Agent 按 `distill-style-library` 分析完自己填 | 0 次（Agent 自己就是那次调用） |
+| `style_card_save` 工具 | Agent 按 `style-library` Skill 分析完自己填 | 0 次（Agent 自己就是那次调用） |
 | `card-test` | 面板「试写一段」，`blindTestPrompt()` 只给卡、不给原文，写完自评匹配度。**正文只回给面板显示，不落盘** | 1 次 |
 
 `parseCardReply()` 从回复里抠 JSON，顺序是：整段 → ```` ```json ```` 块 → 第一个 `{` 到最后一个 `}`。三层都失败才报错，并把回复前 160 字贴出来——不贴的话用户只知道「失败了」，不知道是模型跑题还是格式没跟上。
@@ -136,18 +135,18 @@ node smoke-client.mjs  # 浏览器侧：模块加载、注册调用、布局与�
 | `style_card_get` | 读现有风格卡和注入方式。做增量修订前先调 |
 | `style_card_save` | 存一张风格卡（会覆盖旧的）。字段形状见上面「风格卡」 |
 
-两个 Skill 分工：
+一个 Skill，四段流程：
 
-**[`create-style-library`](skills/create-style-library/SKILL.md)** 是**两阶段**的：
+**[`style-library`](skills/style-library/SKILL.md)** 把「建库」和「提炼卡」串成同一条流程——它们本来就是一批材料上的前后两段，拆成两个 Skill 会让 Agent 和用户都要多判一次「现在该用哪个」：
 
-1. **先定标签**——读完材料自动拟 5～18 个笔调标签加进池子，列给用户看，**停下来等用户增删改**，确认后才继续。
-2. **再按标签切分**——切段、给每段定一个主标签、**同标签的段落连续排在一起**，然后批量存入。库里因此是「一种笔调一组」，轮换时同类笔调连着出现，注入的参考风格更稳。
+1. **定标签**——读完材料自动拟 5～18 个笔调标签加进池子，列给用户看，**停下来等增删改**，确认后才继续。
+2. **切段入库**——切段、给每段定一个主标签、**同标签的段落连续排在一起**，批量存入。条数按材料字数算（约「字数 ÷ 1500」，2 万字要 9～15 条），沿全文铺开不要只摘开头；只摘完整段落、原文逐字照抄。
+3. **提炼卡**——给用户看一眼入库结果，**问一句再动手**；然后九个维度落数 → 合成基因／铁律／禁用／AI 腔 → `style_card_save` → 问要哪种 `mode` 并改。素材不到 3 条时拒绝提炼并说明原因。
+4. **收尾**——`style_library_pick` 设成本局使用，告诉用户去哪看效果。
 
-条数按材料字数算（约「字数 ÷ 1500」，2 万字要 9～15 条），沿全文铺开不要只摘开头；只摘完整段落、原文逐字照抄、标签只描述笔调不描述题材。
+另外列了张「不必走完整流程」的表：用户只说「加几段摘录」或「改个标签」时，直接调对应工具，别硬拉一遍全流程。
 
-**[`distill-style-library`](skills/distill-style-library/SKILL.md)** 用库里的摘录提炼风格卡：九个维度落数 → 合成基因／铁律／禁用／AI 腔 → `style_card_save` → 提醒改 `mode`。素材不到 3 条时它应该拒绝提炼并说明原因，而不是硬凑。
-
-`references/framework.md` 是维度定义和量化阈值（按中文小说校准过），`references/formulas.md` 是叙事公式。两份都在文件末尾保留了上游项目的 MIT 许可原文——`verify.mjs` 里那条「SKILL 提到的工具都真实存在」会扫整个 `skills/` 目录，加 Skill 时记得新 SKILL.md 里只写已注册的工具名。
+`references/framework.md` 是维度定义和量化阈值（按中文小说校准过），`references/formulas.md` 是叙事公式。两份都在文件末尾保留了上游项目的 MIT 许可原文——`verify.mjs` 里那条「SKILL 提到的工具都真实存在」会扫整个 `skills/` 目录，改 SKILL 时记得只写已注册的工具名；另一条断言「只应有一个 Skill」防止以后又被拆开。
 
 ## 布局的坑
 
