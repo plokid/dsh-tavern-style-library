@@ -1338,15 +1338,22 @@ export function apply(ctx, config = {}) {
     const key = str(gameId)
     const turn = await turnOf(key)
     const hit = await resolveFor(key, input, turn)
-    if (!hit) return { text: '', via: '', turn }
+    if (!hit) return { text: '', via: '', turn, chars: 0, cardChars: 0, sampleChars: 0 }
     const place = indexInPool(hit.library, hit.sample)
+    const text = sectionText(hit.library, hit.sample)
+    const sampleText = hit.sample ? hit.sample.text : ''
+    const cardText = usesCard(hit.library) ? cardDigest(hit.library.card) : ''
     return {
       // text 是真正会注入的完整段落（含说明头、规则、原文），调试对照用；
       // sampleText 只有原文、cardText 只有风格卡，面板上给用户看的是这两样——
       // 规则说明对读者没意义，混在一起还会让人以为规则是样文自带的文字。
-      text: sectionText(hit.library, hit.sample),
-      sampleText: hit.sample ? hit.sample.text : '',
-      cardText: usesCard(hit.library) ? cardDigest(hit.library.card) : '',
+      text,
+      sampleText,
+      cardText,
+      // 字数：开了「摘录＋风格卡」每轮多花多少，用户得看得见才谈得上取舍
+      chars: text.length,
+      cardChars: cardText.length,
+      sampleChars: sampleText.length,
       mode: hit.library.mode,
       via: hit.via, turn,
       library: hit.library.name, libraryId: hit.library.id,
@@ -1389,6 +1396,8 @@ export function apply(ctx, config = {}) {
       total: place.total || hit.library.samples.length,
       card: usesCard(hit.library),
       mode: hit.library.mode,
+      // 这一轮实际会占用多少字（和真正注入的是同一段文本）
+      chars: sectionText(hit.library, hit.sample).length,
     }
   })
 

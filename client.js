@@ -1146,6 +1146,9 @@ window.__ModuleLoader__.load({
           onClick: () => setExpanded(value => !value),
         }, info.quote),
         h('div', { className: 'dsl-actions' },
+          // 这一轮要占多少字：开「摘录＋风格卡」的人最关心这个，否则没法判断值不值
+          info.chars ? h('span', { className: 'dsl-hint', style: { flex: 1 } },
+            '本轮注入约 ' + info.chars + ' 字') : null,
           h('button', {
             type: 'button', className: 'dsl-status-link', style: { marginLeft: 0 },
             onClick: open,
@@ -1222,7 +1225,12 @@ window.__ModuleLoader__.load({
           + (result.cardText ? ' · 风格卡' : '')
           + (result.mode === 'card' ? '' : ' · ' + where)
           + (result.sampleSource ? ' · ' + result.sampleSource : '')
-        return [head, result.cardText, result.sampleText].filter(Boolean).join('\n\n')
+        // 字数摆在开头：开了「摘录＋风格卡」的人，最想知道的就是这一轮多花了多少。
+        const size = '约 ' + result.chars + ' 字'
+          + (result.cardText && result.sampleText
+            ? '（卡 ' + result.cardChars + ' + 原文 ' + result.sampleChars + '）'
+            : '')
+        return [head, size, result.cardText, result.sampleText].filter(Boolean).join('\n\n')
       }, [gameId, ui])
 
       const rotateNow = async () => {

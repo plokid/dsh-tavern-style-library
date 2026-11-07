@@ -897,8 +897,19 @@ await check('mode=both 时卡在前、原文在后', async () => {
   assert.ok(text.includes('只借它的笔调'))
 })
 
-await check('mode=card 时只给卡，不给原文', async () => {
-  await cardEnv.call('save-library', { library: { id: cardLibId, name: '卡测试库', mode: 'card' } })
+// 开了「摘录＋风格卡」的人得知道每轮多花多少字，否则没法判断值不值。
+await check('preview / status 报出这一轮的字数', async () => {
+  const preview = await cardEnv.call('preview', { gameId: 'c2', input: '' })
+  assert.equal(preview.chars, preview.text.length, 'chars 应等于真正注入那段文本的长度')
+  assert.ok(preview.cardChars > 0 && preview.sampleChars > 0, 'both 模式下卡和原文都该有字数')
+  // 总长还要算上标题和「只借笔调」那段规则，所以一定比两段之和更长
+  assert.ok(preview.chars > preview.cardChars + preview.sampleChars, '总长应包含标题和规则说明')
+
+  const status = await cardEnv.call('status', { gameId: 'c2' })
+  assert.equal(status.chars, preview.chars, '状态页和预览算出来的应该是同一段文本')
+})
+
+await check('mode=card 时只给卡，不给原文', async () => {  await cardEnv.call('save-library', { library: { id: cardLibId, name: '卡测试库', mode: 'card' } })
   await cardEnv.call('set-active', { gameId: 'c3', libraryId: cardLibId })
   const text = await cardEnv.sections[0].text({ gameId: 'c3', input: '继续' })
   assert.ok(text.includes('■ 风格卡'))
