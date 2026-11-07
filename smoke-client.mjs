@@ -185,7 +185,7 @@ const library = {
 }
 const hosts = {
   list: async () => ({ data: { version: 2, tags: ['冷峻'], libraries: [library] } }),
-  'get-active': async () => ({ active: { libraryId: 'lib1' }, library, sample: library.samples[0], turn: 1 }),
+  'get-active': async () => ({ active: { libraryIds: ['lib1'] }, library, sample: library.samples[0], turn: 1 }),
   status: async () => ({ on: true, turn: 1, library: '冷峻武侠', quote: '样文内容', index: 1, total: 1 }),
   rotate: async () => ({ ok: true }),
   preview: async () => ({ text: 'x', library: '冷峻武侠', sampleIndex: 1, sampleTotal: 1, turn: 1 }),
@@ -207,7 +207,7 @@ const hosts = {
 const source = fs.readFileSync('./client.js', 'utf8')
 // 组件都是模块内私有的，想真的渲染一次就得把它们捞出来：在工厂 return 之前
 // 挂一个探针。只改运行时用的那份字符串，源码本身不动。
-const patched = source.replace('return {\n      name: SELF,', 'globalThis.__probe = { Editor, StyleCardBlock, CardEditor, cardToForm, formToCard }\n    return {\n      name: SELF,')
+const patched = source.replace('return {\n      name: SELF,', 'globalThis.__probe = { Editor, Panel, StyleCardBlock, CardEditor, cardToForm, formToCard }\n    return {\n      name: SELF,')
 assert.ok(patched !== source, '没找到工厂返回处，探针插不进去')
 
 // 同一份源码可以配不同的 React 各加载一次：静态检查用最简替身，
@@ -800,6 +800,38 @@ await check('有上一版才有「恢复上一版」按钮', async () => {
     card: { ...sampleCard, previous: { ...sampleCard, laws: ['上一版的铁律'] } },
   })
   assert.equal(byText(withPrev, '恢复上一版').length, 1, '有上一版时应给出入口')
+})
+
+await check('「本局使用」能勾多个库', async () => {
+  const calls = []
+  let selected = []
+  const two = [
+    { id: 'l1', name: '冷峻甲', tags: ['冷峻'], note: '', mode: 'sample', samples: [{ id: 's1', text: '甲段', tags: [], source: '' }] },
+    { id: 'l2', name: '冷峻乙', tags: ['冷峻'], note: '', mode: 'sample', samples: [{ id: 's2', text: '乙段', tags: [], source: '' }] },
+  ]
+  const ui = makeUi({
+    list: async () => ({ data: { version: 2, tags: [], libraries: two } }),
+    'get-active': async () => ({ active: { libraryIds: selected }, library: null, sample: null, turn: 1 }),
+    'set-active': async payload => { selected = payload.libraryIds || []; calls.push(payload); return { ok: true } },
+    preview: async () => ({ text: 'x', chars: 1, library: '冷峻甲' }),
+  })
+  const tree = runtime.mount(runtime.React.createElement(rtProbe.Panel, { gameId: 'g1', ui }))
+  await runtime.settle()
+
+  const first = byText(tree, '本局使用')[0]
+  assert.ok(first, '列表里没有「本局使用」')
+  first.props.onClick()
+  await runtime.settle()
+  assert.equal(calls.length, 1)
+  assert.deepEqual(calls[0].libraryIds, ['l1'], '第一次应该只选一个')
+
+  // 勾上之后那一个按钮变成「取消」，剩下的「本局使用」就是第二个库
+  const second = byText(tree, '本局使用')[0]
+  assert.ok(second, '第二个库应该还能选')
+  second.props.onClick()
+  await runtime.settle()
+  assert.deepEqual(calls[1].libraryIds, ['l1', 'l2'], '第二次应该变成两个，而不是替换')
+  assert.equal(byText(tree, '本局使用中').length + byText(tree, '取消').length >= 2, true, '两个都应显示为已选')
 })
 
 console.log('\n结果：' + pass + ' 通过，' + fails.length + ' 失败\n')

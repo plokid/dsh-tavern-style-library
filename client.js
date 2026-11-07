@@ -1117,6 +1117,8 @@ window.__ModuleLoader__.load({
       const caption = [
         // 只用风格卡时摘录不参与注入，标「第 2/4 段」只会让人以为它在轮换。
         info.mode !== 'card' && info.total > 1 ? '第 ' + info.index + '/' + info.total + ' 段' : '',
+        // 本局同时用了几个库时，标一句，否则「第 5/9 段」会让人找不到出处
+        info.libraryCount > 1 ? info.libraryCount + ' 个库' : '',
         info.card ? (info.mode === 'card' ? '只用风格卡' : '风格卡') : '',
         info.via === 'marker' ? '#文风 ' + info.markerTag : '',
         info.tags && info.tags.length ? info.tags.join('／') : '',
@@ -1165,7 +1167,7 @@ window.__ModuleLoader__.load({
 
     function Panel({ gameId, ui }) {
       const [data, setData] = useState(null)
-      const [active, setActive] = useState({ libraryId: '' })
+      const [active, setActive] = useState({ libraryIds: [] })
       const [error, setError] = useState('')
       const [busy, setBusy] = useState(false)
       const [preview, setPreview] = useState('')
@@ -1194,7 +1196,7 @@ window.__ModuleLoader__.load({
             call(ui, 'get-active', { gameId }),
           ])
           setData(list.data)
-          setActive(current.active || { libraryId: '' })
+          setActive(current.active || { libraryIds: [] })
           setError('')
         } catch (err) { setError(message(err)) }
       }, [gameId, ui])
@@ -1244,20 +1246,32 @@ window.__ModuleLoader__.load({
         } catch (err) { setError(message(err)) } finally { setBusy(false) }
       }
 
+      // 本局选中的库可以不止一个：拆过库之后要能一起轮换。
+      const selectedIds = Array.isArray(active.libraryIds) ? active.libraryIds : []
+
       const useLibrary = async libraryId => {
         setBusy(true); setError('')
         try {
-          await call(ui, 'set-active', { gameId, libraryId, sampleId: '' })
+          // 列表页的「本局使用」是开关：可以勾上多个库，它们的摘录合成一个池子轮换。
+          const next = selectedIds.includes(libraryId)
+            ? selectedIds.filter(item => item !== libraryId)
+            : [...selectedIds, libraryId]
+          await call(ui, 'set-active', { gameId, libraryIds: next, sampleId: '' })
           await refresh()
-          // 取消时预览没意义，直接收起来；选中时顺手把会用的那段显示出来。
-          setPreview(libraryId ? await fetchPreview() : '')
+          // 全取消时预览没意义，直接收起来；选了就把会用的那段显示出来。
+          setPreview(next.length ? await fetchPreview() : '')
         } catch (err) { setError(message(err)) } finally { setBusy(false) }
       }
 
       const pick = async (libraryId, sampleId) => {
         setPickBusy(true); setPickError('')
         try {
-          await call(ui, 'set-active', { gameId, libraryId, sampleId: sampleId || '' })
+          // 「手动选择」页是单选语义：点「用这个」= 只留这一个；点某条 = 只留这一个并钉住它。
+          await call(ui, 'set-active', {
+            gameId,
+            libraryIds: libraryId ? [libraryId] : [],
+            sampleId: sampleId || '',
+          })
           await refresh()
           setPreview(libraryId ? await fetchPreview() : '')
           setView('list')
@@ -1268,7 +1282,14 @@ window.__ModuleLoader__.load({
         setBusy(true); setError('')
         try {
           await call(ui, 'delete-library', { id: library.id })
-          if (active.libraryId === library.id) await call(ui, 'set-active', { gameId, libraryId: '', sampleId: '' })
+          // 删掉的库如果在本局选里，要从选择里摘掉，其余保留
+          if (selectedIds.includes(library.id)) {
+            await call(ui, 'set-active', {
+              gameId,
+              libraryIds: selectedIds.filter(item => item !== library.id),
+              sampleId: '',
+            })
+          }
           await refresh()
         } catch (err) { setError(message(err)) } finally { setBusy(false) }
       }
@@ -1359,7 +1380,7 @@ window.__ModuleLoader__.load({
           ),
           h('div', { className: 'dsl-page-body' },
           h('p', { className: 'dsl-hint' },
-            '选中后每轮正文都会带上这个库里的一段参考，并在库内逐轮轮换，直到你换掉或取消。点某一条可以只固定用它。'),
+            '这里是单选：点「用这个」只保留这一个库，点某一条就固定用它。要多个库一起轮换，回列表页逐个点「本局使用」。'),
 
           libraries.length === 0
             ? h('section', { className: 'dsh-tavern-settings-group' },
@@ -1369,7 +1390,7 @@ window.__ModuleLoader__.load({
             )
             : h('section', { className: 'dsh-tavern-settings-group' },
               libraries.map(library => {
-                const on = active.libraryId === library.id
+                const on = selectedIds.includes(library.id)
                 return h('div', { key: library.id, className: cx('dsl-item', on && 'is-active') },
                   h('div', { className: 'dsl-item-head' },
                     h('div', { className: 'dsl-item-copy' },
@@ -1397,7 +1418,7 @@ window.__ModuleLoader__.load({
               }),
             ),
 
-          active.libraryId
+          selectedIds.length
             ? h('div', { className: 'dsl-actions' },
               h(Button, { danger: true, disabled: pickBusy, onClick: () => pick('', '') }, '本局取消文风'),
             )
@@ -1581,7 +1602,7 @@ window.__ModuleLoader__.load({
           : null,
 
         h('p', { className: 'dsl-hint' },
-          '这里存你自己的小说摘录，按笔调归档。选中一个库后，每轮正文都会带上它的一段样文做笔调参考，并在库内逐轮轮换。'),
+          '这里存你自己的小说摘录，按笔调归档。「本局使用」可以勾多个库——拆过库之后，几个库的摘录会合成一个池子一起轮换，轮到哪条就用它所属库的卡。'),
         h('p', { className: 'dsl-hint' },
           '攒够摘录后，可以在库里提炼一张「风格卡」：九个维度的观察、写作基因、铁律、禁用清单。开了它，注入的就是规则加证据。'),
         h('p', { className: 'dsl-hint is-warn' },
@@ -1602,7 +1623,7 @@ window.__ModuleLoader__.load({
             )
             : h('section', { className: 'dsh-tavern-settings-group' },
               visible.map(library => {
-                const on = active.libraryId === library.id
+                const on = selectedIds.includes(library.id)
                 const count = (library.samples || []).length
                 const matched = hitsIn(library)
                 const asking = pendingDelete && pendingDelete.kind === 'library' && pendingDelete.id === library.id
@@ -1657,7 +1678,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dsl-actions' },
           h(Button, { onClick: () => setView('pick') }, '手动选择'),
           h(Button, { onClick: showPreview }, '预览下一轮'),
-          active.libraryId ? h(Button, { disabled: busy, onClick: rotateNow }, '换一段') : null,
+          selectedIds.length ? h(Button, { disabled: busy, onClick: rotateNow }, '换一段') : null,
         ),
         preview ? h('div', { className: 'dsl-quote is-open' }, preview) : null,
         h('p', { className: 'dsl-hint' },

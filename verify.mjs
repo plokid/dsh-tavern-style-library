@@ -720,6 +720,122 @@ await check('状态分节标出 #文风 标记来源', async () => {
   assert.equal(status.markerTag, '轮换库')
 })
 
+console.log('\n== 多选库（拆库之后一起用）==')
+
+const multiEnv = makeRotateEnv()
+plugin.apply(multiEnv.ctx)
+let libA = null
+let libB = null
+
+await check('建两个库，各两段', async () => {
+  libA = await multiEnv.call('save-library', { library: { name: '库甲', tags: ['冷峻'] } })
+  libB = await multiEnv.call('save-library', { library: { name: '库乙', tags: ['冷峻'] } })
+  for (const [lib, tag] of [[libA, '甲'], [libB, '乙']]) {
+    for (let index = 1; index <= 2; index += 1) {
+      await multiEnv.call('save-sample', {
+        libraryId: lib.id,
+        sample: {
+          text: tag + '库第' + index + '段。' + '用来把这一段撑到有意义的长度。'.repeat(3),
+          tags: ['冷峻'], source: tag + index,
+        },
+      })
+    }
+  }
+  const list = await multiEnv.call('list')
+  assert.equal(list.data.libraries.length, 2)
+})
+
+await check('选两个库之后，轮换在拼接池里走', async () => {
+  await multiEnv.call('set-active', { gameId: 'm1', libraryIds: [libA.id, libB.id] })
+  const seen = []
+  for (const turn of [1, 2, 3, 4, 5]) {
+    multiEnv.setTurn(turn)
+    const status = await multiEnv.call('status', { gameId: 'm1' })
+    seen.push(status.library + '#' + status.index)
+  }
+  assert.deepEqual(seen, ['库甲#1', '库甲#2', '库乙#3', '库乙#4', '库甲#1'], '实际：' + seen.join(', '))
+  const status = await multiEnv.call('status', { gameId: 'm1' })
+  assert.equal(status.total, 4, '总段数应是两库之和')
+  assert.equal(status.libraryCount, 2)
+})
+
+await check('注入时用的是「那条摘录所属的库」', async () => {
+  multiEnv.setTurn(3)
+  const preview = await multiEnv.call('preview', { gameId: 'm1', input: '' })
+  assert.equal(preview.library, '库乙', '第 3 段属于库乙')
+  assert.ok(preview.sampleText.includes('乙库第1段'), '实际：' + preview.sampleText.slice(0, 12))
+})
+
+await check('钉住另一个库里的某条也能用', async () => {
+  const list = await multiEnv.call('list')
+  const b = list.data.libraries.find(item => item.id === libB.id)
+  await multiEnv.call('set-active', {
+    gameId: 'm2', libraryIds: [libA.id, libB.id], sampleId: b.samples[1].id,
+  })
+  for (const turn of [1, 2, 3]) {
+    multiEnv.setTurn(turn)
+    const status = await multiEnv.call('status', { gameId: 'm2' })
+    assert.equal(status.library, '库乙')
+    assert.equal(status.index, 4, '钉住的是拼接池里的第 4 条')
+  }
+})
+
+await check('get-active 返回选中的全部库', async () => {
+  const out = await multiEnv.call('get-active', { gameId: 'm1' })
+  assert.deepEqual(out.active.libraryIds, [libA.id, libB.id])
+  assert.equal(out.libraries.length, 2)
+  assert.ok(out.library, '应给出这一轮用的库')
+})
+
+await check('老的单个 libraryId 写法仍然能用', async () => {
+  await multiEnv.call('set-active', { gameId: 'm3', libraryId: libA.id })
+  const out = await multiEnv.call('get-active', { gameId: 'm3' })
+  assert.deepEqual(out.active.libraryIds, [libA.id])
+  multiEnv.setTurn(1)
+  const status = await multiEnv.call('status', { gameId: 'm3' })
+  assert.equal(status.total, 2, '只选一个库时池子就是它自己')
+})
+
+await check('最多同时选 8 个库', async () => {
+  const ids = []
+  for (let index = 0; index < 10; index += 1) {
+    const lib = await multiEnv.call('save-library', { library: { name: '批量库' + index } })
+    ids.push(lib.id)
+  }
+  await multiEnv.call('set-active', { gameId: 'm4', libraryIds: ids })
+  const out = await multiEnv.call('get-active', { gameId: 'm4' })
+  assert.equal(out.active.libraryIds.length, 8, '多给的应该被截掉')
+})
+
+await check('只出卡的库不占轮换池', async () => {
+  const cardLib = await multiEnv.call('save-library', { library: { name: '卡片库', mode: 'card' } })
+  await multiEnv.call('save-sample', {
+    libraryId: cardLib.id,
+    sample: { text: '这条不该进轮换池，因为它所在的库只用卡。'.repeat(2), tags: [] },
+  })
+  await multiEnv.call('card-save', {
+    libraryId: cardLib.id,
+    card: { dimensions: { lexical: ['一句话的观察'] }, laws: ['一条铁律'] },
+  })
+  await multiEnv.call('set-active', { gameId: 'm5', libraryIds: [cardLib.id, libA.id] })
+  multiEnv.setTurn(1)
+  const status = await multiEnv.call('status', { gameId: 'm5' })
+  assert.equal(status.total, 2, '池子只算库甲的 2 段')
+  assert.equal(status.library, '库甲')
+})
+
+await check('pick 工具支持一次选多个库', async () => {
+  const pick = multiEnv.registered.find(item => item.name === 'style_library_pick')
+  assert.ok(pick, '没注册 pick 工具')
+  const out = await pick.execute(
+    { libraries: ['库甲', '库乙'] },
+    { agent: { session: { id: 'g-multi' } } },
+  )
+  assert.equal(out.ok, true)
+  assert.ok(out.text.includes('库甲') && out.text.includes('库乙'))
+  assert.deepEqual(multiEnv.gameStore.get('g-multi').libraryIds, [libA.id, libB.id])
+})
+
 console.log('\n== 子作用域兼容（Cordis 给的是 childContext）==')
 
 await check('只有 ctx.get 时也能拿到 tavern 和 tools', async () => {

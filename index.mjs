@@ -30,6 +30,9 @@ const MAX_SAMPLE_CHARS = 2000
 const MIN_SAMPLE_CHARS = 40
 const MAX_SAMPLES_PER_LIBRARY = 40
 const MAX_LIBRARIES = 60
+// 一局最多同时用几个库。给上限不是怕存不下，是怕「全选」之后轮换变成随机：
+// 库一多，每轮换库比换段还勤，笔调反而跳。
+const MAX_SELECTED_LIBRARIES = 8
 const MAX_SECTION_CHARS = 7800
 const DATA_BUDGET = 250 * 1024
 
@@ -107,6 +110,17 @@ const clampInt = (value, min, max) => {
 
 function newId() {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4)
+}
+
+/** 本局选中的库 id 列表：去重、去空、截到上限。 */
+function cleanLibraryIds(value) {
+  const out = []
+  for (const item of Array.isArray(value) ? value : []) {
+    const id = str(item)
+    if (id && !out.includes(id)) out.push(id)
+    if (out.length >= MAX_SELECTED_LIBRARIES) break
+  }
+  return out
 }
 
 function cleanTagList(value, max) {
@@ -646,27 +660,49 @@ function normalize(raw) {
 // wantedSampleId 是对局数据里钉住的那一条；seed 让同一库在不同轮次换用不同样文。
 // extra 是手动「换一段」累计的位移，会随对局数据存下来，所以换了之后下一轮起真的变了。
 // 钉住一条（用户在面板里点过某条）时永远用它，不参与轮换。
+// 一个库的候选池：和库标签有交集的优先，交集为空就整库。
+function poolOf(library) {
+  if (!library || library.samples.length === 0) return []
+  const shared = library.samples.filter(item => item.tags.some(tag => library.tags.includes(tag)))
+  return shared.length ? shared : library.samples
+}
+
+// 一局可以选多个库（拆库之后要能一起用）：候选池是各库候选池的拼接，
+// 轮换在整个拼接池里走；轮到哪一条，就用那条所属库的卡和注入方式。
+function unionPool(libraries) {
+  const out = []
+  for (const library of libraries) {
+    // 「只用风格卡」的库的摘录不参与注入，也就不该进轮换池——
+    // 轮到它只会白转一格，注入的还是没有摘录的卡。
+    if (cardOnly(library)) continue
+    for (const sample of poolOf(library)) out.push({ library, sample })
+  }
+  return out
+}
+
+/** 第 seed 轮（外加手动位移）在长度为 length 的池子里取第几个。 */
+function offsetIn(length, seed, extra = 0) {
+  if (!length) return 0
+  const base = Number.isFinite(Number(seed)) ? Math.trunc(Number(seed)) - 1 : 0
+  const shift = Number.isFinite(Number(extra)) ? Math.trunc(Number(extra)) : 0
+  return ((base + shift) % length + length) % length
+}
+
 function sampleFor(library, wantedSampleId, seed, extra = 0) {
-  if (!library || library.samples.length === 0) return null
+  const pool = poolOf(library)
+  if (pool.length === 0) return null
   if (wantedSampleId) {
+    // 钉住的那条可能不在标签交集里，所以按整库找，找不到再回轮换
     const wanted = library.samples.find(item => item.id === wantedSampleId)
     if (wanted) return wanted
   }
-  // 和库标签有交集的优先，在交集里轮换；交集为空就整个库轮换。
-  // 用 seed-1 让第 1 轮从第一条开始，再加上手动换过的位移。
-  const shared = library.samples.filter(item => item.tags.some(tag => library.tags.includes(tag)))
-  const pool = shared.length ? shared : library.samples
-  const base = Number.isFinite(Number(seed)) ? Math.trunc(Number(seed)) - 1 : 0
-  const shift = Number.isFinite(Number(extra)) ? Math.trunc(Number(extra)) : 0
-  const offset = ((base + shift) % pool.length + pool.length) % pool.length
-  return pool[offset]
+  return pool[offsetIn(pool.length, seed, extra)]
 }
 
 /** 手动位移之后，这一条在这个库的候选池里排第几（1 起）。 */
 function indexInPool(library, sample) {
-  if (!library || !sample) return { index: 0, total: 0 }
-  const shared = library.samples.filter(item => item.tags.some(tag => library.tags.includes(tag)))
-  const pool = shared.length ? shared : library.samples
+  const pool = poolOf(library)
+  if (!sample) return { index: 0, total: pool.length }
   return { index: pool.findIndex(item => item.id === sample.id) + 1, total: pool.length }
 }
 
@@ -826,15 +862,17 @@ export function apply(ctx, config = {}) {
   }
 
   async function selectionFor(gameId) {
-    if (!gameId) return { libraryId: '', sampleId: '', shift: 0 }
+    if (!gameId) return { libraryIds: [], sampleId: '', shift: 0 }
     if (selections.has(gameId)) return selections.get(gameId)
-    let value = { libraryId: '', sampleId: '', shift: 0 }
+    let value = { libraryIds: [], sampleId: '', shift: 0 }
     try {
       const raw = await tavern.readGameData({ gameId })
       const data = raw && typeof raw === 'object' && raw.data && typeof raw.data === 'object' ? raw.data : raw
       if (data && typeof data === 'object') {
+        // libraryIds 是多选之后的新字段；老数据只有 libraryId，读的时候顺手迁移。
+        const source = Array.isArray(data.libraryIds) ? data.libraryIds : [data.libraryId]
         value = {
-          libraryId: str(data.libraryId),
+          libraryIds: cleanLibraryIds(source),
           sampleId: str(data.sampleId),
           shift: Number.isFinite(Number(data.shift)) ? Math.trunc(Number(data.shift)) : 0,
         }
@@ -844,9 +882,12 @@ export function apply(ctx, config = {}) {
     return value
   }
 
-  async function writeSelection(gameId, libraryId, sampleId, shift = 0) {
+  async function writeSelection(gameId, libraryIds, sampleId, shift = 0) {
+    const ids = cleanLibraryIds(libraryIds)
     const value = {
-      libraryId: str(libraryId),
+      // libraryId 留着写第一个：旧面板/旧存档回退时还读得到
+      libraryId: ids[0] || '',
+      libraryIds: ids,
       sampleId: str(sampleId),
       shift: Number.isFinite(Number(shift)) ? Math.trunc(Number(shift)) : 0,
     }
@@ -862,6 +903,7 @@ export function apply(ctx, config = {}) {
     return rotationSeed.get(str(gameId)) || 0
   }
 
+  /** 这一轮用哪一条、以及它排第几。返回的 library 永远是「这条摘录所属的那个库」。 */
   async function resolveFor(gameId, input, turn) {
     const data = await load()
     if (data.libraries.length === 0) return null
@@ -873,14 +915,35 @@ export function apply(ctx, config = {}) {
       // 能不能用不能只看 sample：库里的摘录被删光、但还留着风格卡时，
       // 「摘录＋风格卡」这一档应该退化成只注入卡，而不是整段消失。
       if (hit.library && (hit.sample || usesCard(hit.library))) {
-        return { library: hit.library, sample: hit.sample || null, via: 'marker' }
+        return {
+          library: hit.library,
+          sample: hit.sample || null,
+          via: 'marker',
+          place: indexInPool(hit.library, hit.sample),
+        }
       }
     }
-    const library = data.libraries.find(item => item.id === active.libraryId)
-    if (!library) return null
-    const sample = sampleFor(library, active.sampleId, seed, active.shift)
-    if (sample || usesCard(library)) return { library, sample: sample || null, via: 'active' }
-    return null
+
+    const libraries = active.libraryIds
+      .map(id => data.libraries.find(item => item.id === id))
+      .filter(Boolean)
+    if (libraries.length === 0) return null
+
+    const pool = unionPool(libraries)
+    if (pool.length === 0) {
+      // 选中的库都是空的、或者只有卡：挑第一个能出内容的顶上
+      const only = libraries.find(usesCard)
+      return only ? { library: only, sample: null, via: 'active', place: { index: 0, total: 0 } } : null
+    }
+
+    // 钉住的那条：在拼接池里找，找到就用它，并且用它的库
+    if (active.sampleId) {
+      const at = pool.findIndex(entry => entry.sample.id === active.sampleId)
+      if (at >= 0) return { ...pool[at], via: 'active', place: { index: at + 1, total: pool.length } }
+    }
+
+    const offset = offsetIn(pool.length, seed, active.shift)
+    return { ...pool[offset], via: 'active', place: { index: offset + 1, total: pool.length } }
   }
 
   // ── 存储操作：面板和 Agent 工具共用 ──────────────────────────────
@@ -1270,21 +1333,36 @@ export function apply(ctx, config = {}) {
     const key = str(gameId)
     const data = await load()
     const active = await selectionFor(key)
-    const library = data.libraries.find(item => item.id === active.libraryId) || null
     const turn = await turnOf(key)
-    const sample = library ? sampleFor(library, active.sampleId, turn, active.shift) : null
-    return { active, library, sample, turn }
+    // library 是「这一轮那条摘录所属的库」，libraries 是本局选中的全部
+    const libraries = active.libraryIds
+      .map(id => data.libraries.find(item => item.id === id))
+      .filter(Boolean)
+    const hit = await resolveFor(key, '', turn)
+    return {
+      active,
+      library: hit ? hit.library : null,
+      libraries,
+      sample: hit ? hit.sample : null,
+      place: hit ? hit.place : { index: 0, total: 0 },
+      turn,
+    }
   })
 
-  handle('set-active', async ({ gameId, libraryId, sampleId } = {}) => {
+  handle('set-active', async ({ gameId, libraryIds, libraryId, sampleId } = {}) => {
     const data = await load()
-    const id = str(libraryId)
-    if (id && !data.libraries.some(item => item.id === id)) throw new Error('没有这个样文库')
+    // libraryIds 优先；老的 libraryId（单个）照旧能用
+    const ids = cleanLibraryIds(Array.isArray(libraryIds) ? libraryIds : [libraryId])
+    for (const id of ids) {
+      if (!data.libraries.some(item => item.id === id)) throw new Error('没有这个样文库')
+    }
     // sampleId 为空表示按轮次轮换；给了具体 id 就钉死在这一条。
-    // 换库时把手动位移归零，否则新库会从中间某段开始。
+    // 选中的库变了就把手动位移归零，否则新组合会从中间某段开始。
     const previous = await selectionFor(str(gameId))
-    const shift = previous.libraryId === id ? previous.shift : 0
-    await writeSelection(str(gameId), id, str(sampleId), shift)
+    const same = ids.length === previous.libraryIds.length
+      && ids.every((id, index) => id === previous.libraryIds[index])
+    const shift = same ? previous.shift : 0
+    await writeSelection(str(gameId), ids, str(sampleId), shift)
     return { ok: true }
   })
 
@@ -1296,32 +1374,37 @@ export function apply(ctx, config = {}) {
     const key = str(gameId)
     const data = await load()
     const active = await selectionFor(key)
-    const library = data.libraries.find(item => item.id === active.libraryId)
-    if (!library || library.samples.length === 0) {
+    const libraries = active.libraryIds
+      .map(id => data.libraries.find(item => item.id === id))
+      .filter(Boolean)
+    if (libraries.length === 0) {
       return { ok: false, text: '本局还没选样文库，先去侧栏选一个。' }
     }
-    if (cardOnly(library)) {
-      return { ok: false, text: '这个库设成「只用风格卡」，摘录不参与注入；要换段就把注入方式改成「摘录＋风格卡」。' }
+    const pool = unionPool(libraries)
+    if (pool.length === 0) {
+      // 全是只出卡的库
+      return libraries.some(cardOnly)
+        ? { ok: false, text: '选中的库都设成「只用风格卡」，摘录不参与注入；要换段就把注入方式改成「摘录＋风格卡」。' }
+        : { ok: false, text: '选中的库里还没有摘录，先存几段。' }
     }
-    const shared = library.samples.filter(item => item.tags.some(tag => library.tags.includes(tag)))
-    const pool = shared.length ? shared : library.samples
     if (pool.length < 2) {
-      return { ok: false, text: '这个库只有一段样文，换不了；再存几段就能轮换。' }
+      return { ok: false, text: '现在只有一段摘录可换；再多存几段（或在别的库里也存）就能轮换。' }
     }
     const turn = await turnOf(key)
-    // 位移 +1，再从池里取出对应的那一段；钉住某条时顺带解除钉住。
+    // 位移 +1，再从拼接池里取出对应的那一段；钉住某条时顺带解除钉住。
     const shift = (Number.isFinite(Number(active.shift)) ? Math.trunc(Number(active.shift)) : 0) + 1
-    const next = sampleFor(library, '', turn, shift)
-    await writeSelection(key, library.id, '', shift)
-    const { index, total } = indexInPool(library, next)
+    const next = pool[offsetIn(pool.length, turn, shift)]
+    await writeSelection(key, active.libraryIds, '', shift)
     return {
       ok: true,
       shift,
-      sampleId: next.id,
-      source: next.source,
-      quote: next.text,
-      index,
-      total,
+      sampleId: next.sample.id,
+      source: next.sample.source,
+      quote: next.sample.text,
+      library: next.library.name,
+      libraryId: next.library.id,
+      index: offsetIn(pool.length, turn, shift) + 1,
+      total: pool.length,
       text: '下一轮起改用这一段。',
     }
   })
@@ -1330,7 +1413,7 @@ export function apply(ctx, config = {}) {
   handle('unpin', async ({ gameId } = {}) => {
     const key = str(gameId)
     const active = await selectionFor(key)
-    await writeSelection(key, active.libraryId, '', 0)
+    await writeSelection(key, active.libraryIds, '', 0)
     return { ok: true }
   })
 
@@ -1339,7 +1422,7 @@ export function apply(ctx, config = {}) {
     const turn = await turnOf(key)
     const hit = await resolveFor(key, input, turn)
     if (!hit) return { text: '', via: '', turn, chars: 0, cardChars: 0, sampleChars: 0 }
-    const place = indexInPool(hit.library, hit.sample)
+    const place = hit.place || indexInPool(hit.library, hit.sample)
     const text = sectionText(hit.library, hit.sample)
     const sampleText = hit.sample ? hit.sample.text : ''
     const cardText = usesCard(hit.library) ? cardDigest(hit.library.card) : ''
@@ -1374,13 +1457,13 @@ export function apply(ctx, config = {}) {
     if (!hit) {
       const reason = data.libraries.length === 0
         ? '还没有样文库。'
-        : (active.libraryId ? '选中的库没有样文，也没有风格卡。' : '本局没有选样文库。')
+        : (active.libraryIds.length ? '选中的库没有样文，也没有风格卡。' : '本局没有选样文库。')
       return {
         on: false, turn, via: '', library: '', quote: '', source: '', index: 0, total: 0,
         card: false, mode: 'sample', hint: reason,
       }
     }
-    const place = indexInPool(hit.library, hit.sample)
+    const place = hit.place || indexInPool(hit.library, hit.sample)
     return {
       on: true,
       turn,
@@ -1388,12 +1471,14 @@ export function apply(ctx, config = {}) {
       markerTag: marker ? marker[1] : '',
       library: hit.library.name,
       libraryId: hit.library.id,
+      // 本局同时用了几个库：状态页要能看出「这段来自哪一个」
+      libraryCount: active.libraryIds.length,
       source: hit.sample ? hit.sample.source : '',
       // 只用风格卡时没有摘录可显示，就用卡里的三行观察顶替引文位置。
       quote: hit.sample ? hit.sample.text : cardBrief(hit.library.card),
       tags: hit.sample ? hit.sample.tags : (hit.library.tags || []),
       index: place.index || 1,
-      total: place.total || hit.library.samples.length,
+      total: place.total || 0,
       card: usesCard(hit.library),
       mode: hit.library.mode,
       // 这一轮实际会占用多少字（和真正注入的是同一段文本）
@@ -1782,12 +1867,18 @@ export function apply(ctx, config = {}) {
 
     add({
       name: 'style_library_pick',
-      description: '把某个样文库设为本局使用的文风来源。设了之后，每轮写正文都会带上它的笔调参考'
-        + '（一段原文，或者它提炼出的风格卡，看这个库的注入方式）。传空库名表示取消。',
+      description: '把样文库设为本局使用的文风来源（可以一次选多个）。设了之后，每轮写正文都会带上'
+        + '它们的笔调参考（一段原文，或者它提炼出的风格卡，看那个库的注入方式）；'
+        + '选多个时，几个库的摘录合成一个池子按轮次轮换，轮到哪条就用它所属库的卡。'
+        + '传空的 library / libraries 表示取消。',
       parameters: {
         type: 'object', additionalProperties: false,
         properties: {
-          library: { type: 'string', description: '库名或库 id；留空表示本局不使用样文库。' },
+          library: { type: 'string', description: '单个库名或库 id；留空表示本局不使用样文库。' },
+          libraries: {
+            type: 'array', items: { type: 'string' },
+            description: '要一起用的库名或 id，最多 8 个。拆过库之后用它一次选上多个；给了它就不看 library。',
+          },
         },
       },
       output: {
@@ -1803,25 +1894,35 @@ export function apply(ctx, config = {}) {
           // 卡片工作台里没有对局，库里先记下意图即可
           return { ok: false, text: '当前不在对局中，没法设置本局使用。等开了游戏，在面板或输入框上方的「文风」按钮里选。' }
         }
-        const wanted = str(args && args.library).trim()
-        if (!wanted) {
-          await writeSelection(gameId, '', '')
+        const data = await load()
+        const wanted = Array.isArray(args && args.libraries) && args.libraries.length
+          ? args.libraries.map(item => str(item).trim()).filter(Boolean)
+          : [str(args && args.library).trim()].filter(Boolean)
+        if (wanted.length === 0) {
+          await writeSelection(gameId, [], '')
           return { ok: true, text: '本局已取消样文库，之后不再注入文风参考。' }
         }
-        const data = await load()
-        const library = data.libraries.find(item => item.id === wanted) || data.libraries.find(item => item.name === wanted)
-        if (!library) throw new Error('没有样文库「' + wanted + '」')
-        // 没有摘录时，只有「卡会真的进注入」才算可用——否则选了等于什么都没带。
-        if (library.samples.length === 0 && !usesCard(library)) {
-          throw new Error(library.card
-            ? '「' + library.name + '」里没有摘录，注入方式又是「只用摘录」，这一局什么都不会带。把注入方式改成「摘录＋风格卡」或「只用风格卡」再用。'
-            : '「' + library.name + '」里还没有样文，先存几段')
+        const picked = []
+        for (const item of wanted) {
+          const library = data.libraries.find(entry => entry.id === item) || data.libraries.find(entry => entry.name === item)
+          if (!library) throw new Error('没有样文库「' + item + '」')
+          // 没有摘录时，只有「卡会真的进注入」才算可用——否则选了等于什么都没带。
+          if (library.samples.length === 0 && !usesCard(library)) {
+            throw new Error(library.card
+              ? '「' + library.name + '」里没有摘录，注入方式又是「只用摘录」，这一局什么都不会带。把注入方式改成「摘录＋风格卡」或「只用风格卡」再用。'
+              : '「' + library.name + '」里还没有样文，先存几段')
+          }
+          if (!picked.some(entry => entry.id === library.id)) picked.push(library)
         }
-        await writeSelection(gameId, library.id, '')
+        if (picked.length > MAX_SELECTED_LIBRARIES) {
+          throw new Error('一局最多同时用 ' + MAX_SELECTED_LIBRARIES + ' 个库；库一多，每轮换库比换段还勤，笔调反而跳')
+        }
+        await writeSelection(gameId, picked.map(item => item.id), '')
         return {
           ok: true,
-          text: '本局改用样文库「' + library.name + '」，之后每轮正文都会带它的笔调参考'
-            + (usesCard(library) ? '（含风格卡）。' : '。'),
+          text: '本局改用样文库「' + picked.map(item => item.name).join('」「') + '」，之后每轮正文都会带它们的笔调参考'
+            + (picked.some(usesCard) ? '（含风格卡）' : '')
+            + (picked.length > 1 ? '；' + picked.length + ' 个库的摘录合成一个池子轮换。' : '。'),
         }
       },
     })
