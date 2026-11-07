@@ -247,12 +247,114 @@ window.__ModuleLoader__.load({
     // ── 风格卡 ──────────────────────────────────────────────────
     // 一张卡是整库提炼出来的规则集：九个维度的观察、写作基因、铁律、禁用清单、
     // AI 腔词表。摘录是「长这样」，卡是「必须这样、绝不那样」。
-    // 面板上只做三件事：展示、触发提炼/试写、导出成 Portable Prompt。
     const DIMENSION_LABELS = [
       ['lexical', '词汇'], ['syntactic', '句法'], ['tonal', '语气'],
       ['discourse', '篇章'], ['rhetoric', '修辞'], ['emotion', '情感'],
       ['perspective', '视角'], ['imagery', '感官'], ['dialogue', '对白'],
     ]
+
+    // 卡 ↔ 表单文本。九维和三个列表都按「一行一条」编辑：用户不用碰 JSON，
+    // 解析也简单，截断/去重照旧交给宿主侧的 normalizeCard。
+    const linesOf = text => String(text || '')
+      .split('\n')
+      .map(line => line.replace(/^\s*[-*]\s*/u, '').trim())
+      .filter(Boolean)
+
+    function cardToForm(card) {
+      const dimensions = {}
+      for (const [key] of DIMENSION_LABELS) {
+        dimensions[key] = (((card && card.dimensions) || {})[key] || []).join('\n')
+      }
+      return {
+        summary: (card && card.summary) || '',
+        mantra: (card && card.mantra) || '',
+        formula: (card && card.formula) || '',
+        dimensions,
+        genes: ((card && card.genes) || [])
+          .map(gene => gene.name + (gene.text ? '：' + gene.text : '')).join('\n'),
+        laws: ((card && card.laws) || []).join('\n'),
+        disallowed: ((card && card.disallowed) || []).join('\n'),
+        aiBan: ((card && card.aiBan) || []).join('\n'),
+      }
+    }
+
+    function formToCard(form, base) {
+      const dimensions = {}
+      for (const [key] of DIMENSION_LABELS) {
+        const points = linesOf(form.dimensions[key])
+        if (points.length) dimensions[key] = points
+      }
+      const genes = linesOf(form.genes).map(line => {
+        const at = line.search(/[：:]/u)
+        return at > 0
+          ? { name: line.slice(0, at).trim(), text: line.slice(at + 1).trim() }
+          : { name: line, text: '' }
+      })
+      return {
+        // 空字符串要显式给出去：宿主按 `??` 取值，给 undefined 会保留旧值
+        ...(base || {}),
+        summary: String(form.summary || '').trim(),
+        mantra: String(form.mantra || '').trim(),
+        formula: String(form.formula || '').trim(),
+        dimensions,
+        genes,
+        laws: linesOf(form.laws),
+        disallowed: linesOf(form.disallowed),
+        aiBan: String(form.aiBan || '').split(/[\n、,，]/u).map(item => item.trim()).filter(Boolean),
+      }
+    }
+
+    // 一条一行地改。改完整体提交，宿主负责截断、去重和容量检查。
+    function CardEditor({ ui, libraryId, card, onSaved, onCancel }) {
+      const [form, setForm] = useState(() => cardToForm(card))
+      const [busy, setBusy] = useState(false)
+      const [error, setError] = useState('')
+      const patch = changes => setForm(current => ({ ...current, ...changes }))
+      const patchDimension = (key, value) => setForm(current => ({
+        ...current,
+        dimensions: { ...current.dimensions, [key]: value },
+      }))
+
+      const save = async () => {
+        setBusy(true); setError('')
+        try {
+          const result = await call(ui, 'card-save', { libraryId, card: formToCard(form, card) })
+          onSaved(result.card)
+        } catch (err) { setError(message(err)) } finally { setBusy(false) }
+      }
+
+      const area = (label, value, onChange, hint) => h('div', { className: 'dsl-field' },
+        h('div', { className: 'dsl-field-label' }, label),
+        h('textarea', {
+          className: 'dsl-area', value, 'aria-label': label,
+          onChange: event => onChange(event.target.value),
+        }),
+        hint ? h('p', { className: 'dsl-hint' }, hint) : null,
+      )
+
+      return h('div', { className: 'dsl-card' },
+        h('p', { className: 'dsl-hint' },
+          '一行一条。改完点保存——空着的维度/小节会从卡里去掉，不会被写成空条目。'),
+
+        area('指纹小结', form.summary, value => patch({ summary: value })),
+
+        DIMENSION_LABELS.map(([key, label]) =>
+          h('div', { key }, area(label, form.dimensions[key], value => patchDimension(key, value)))),
+
+        area('写作基因', form.genes, value => patch({ genes: value }), '一行一条，写成「名称：说明」'),
+        area('铁律', form.laws, value => patch({ laws: value })),
+        area('从不出现', form.disallowed, value => patch({ disallowed: value })),
+        area('AI 腔', form.aiBan, value => patch({ aiBan: value }), '一行一个词，也可以用顿号隔开'),
+        area('起笔口诀', form.mantra, value => patch({ mantra: value })),
+        area('叙事公式', form.formula, value => patch({ formula: value })),
+
+        error ? h('p', { className: 'dsl-error' }, error) : null,
+        h('div', { className: 'dsl-actions' },
+          h(Button, { primary: true, disabled: busy, onClick: save }, busy ? '保存中…' : '保存'),
+          h(Button, { disabled: busy, onClick: onCancel }, '取消'),
+        ),
+      )
+    }
 
     function StyleCardBlock({ ui, gameId, libraryId, card, onChanged }) {
       const [busy, setBusy] = useState('')
@@ -263,6 +365,11 @@ window.__ModuleLoader__.load({
       // 试写结果只活在这个组件里：模型按卡写的一段字，看完就没必要留住，
       // 存进卡只会让它变大、并让「改卡→再试」越试越挤。
       const [sample, setSample] = useState(null)
+      // 手改模式：把只读展示换成一张表单
+      const [editing, setEditing] = useState(false)
+      // 粘贴导入：别人给的卡、或从别处导出的 Prompt
+      const [pasting, setPasting] = useState(false)
+      const [draftText, setDraftText] = useState('')
 
       const run = async (label, action, args, done) => {
         setBusy(label); setError(''); setNotice('')
@@ -296,6 +403,17 @@ window.__ModuleLoader__.load({
         setNotice('风格卡已清除，这个库回到只用摘录。')
       })
 
+      const importCard = async () => {
+        setBusy('import'); setError(''); setNotice('')
+        try {
+          const result = await call(ui, 'card-import', { libraryId, text: draftText })
+          setPasting(false)
+          setDraftText('')
+          onChanged(result.card)
+          setNotice('已导入这张风格卡。想让它在正文里生效，把上面的「每轮注入什么」改成含卡的档位。')
+        } catch (err) { setError(message(err)) } finally { setBusy('') }
+      }
+
       if (!card) {
         return h('section', { className: 'dsh-tavern-settings-group' },
           h('div', { className: 'dsl-section' },
@@ -307,11 +425,49 @@ window.__ModuleLoader__.load({
               '用本局后台模型提炼，会产生一次调用；也可以用卡片工作台里的 Agent（说「把这个库提炼成风格卡」），'
               + '它会按 style-library 的流程分析。'),
             h('div', { className: 'dsl-actions' },
-              h(Button, { primary: true, disabled: busy || !libraryId, onClick: distill },
+              h(Button, { primary: true, disabled: Boolean(busy) || !libraryId, onClick: distill },
                 busy === 'distill' ? '提炼中…' : 'AI 提炼风格卡'),
+              h(Button, {
+                disabled: Boolean(busy) || !libraryId,
+                onClick: () => { setPasting(value => !value); setError('') },
+              }, pasting ? '收起' : '粘贴一张卡'),
             ),
+
+            pasting
+              ? h('div', { className: 'dsl-field' },
+                h('p', { className: 'dsl-hint' },
+                  '贴一段「导出 Prompt」的原文，或者同格式的手写卡——要有「## 铁律」「### 词汇」这类标题。'),
+                h('textarea', {
+                  className: 'dsl-area', value: draftText, 'aria-label': '粘贴风格卡',
+                  placeholder: '# 写作风格 Prompt · 作者（体裁）\n\n## 铁律\n1. …',
+                  onChange: event => setDraftText(event.target.value),
+                }),
+                h('div', { className: 'dsl-actions' },
+                  h(Button, { primary: true, disabled: Boolean(busy) || !draftText.trim(), onClick: importCard },
+                    busy === 'import' ? '导入中…' : '导入'),
+                ),
+              )
+              : null,
+
             notice ? h('p', { className: 'dsl-hint' }, notice) : null,
             error ? h('p', { className: 'dsl-error' }, error) : null,
+          ),
+        )
+      }
+
+      if (editing) {
+        return h('section', { className: 'dsh-tavern-settings-group' },
+          h('div', { className: 'dsl-section' },
+            h('div', { className: 'dsl-section-title' }, '编辑风格卡'),
+            h(CardEditor, {
+              ui, libraryId, card,
+              onSaved: next => {
+                setEditing(false)
+                onChanged(next)
+                setNotice('风格卡已更新。')
+              },
+              onCancel: () => setEditing(false),
+            }),
           ),
         )
       }
@@ -404,6 +560,9 @@ window.__ModuleLoader__.load({
               onCancel: () => setConfirming(false),
             })
             : h('div', { className: 'dsl-actions' },
+              // 卡是模型按材料写的，对不对得用户自己看——看出来了就要能改，
+              // 否则只能整张重新提炼，碰运气。
+              h(Button, { small: true, disabled: Boolean(busy), onClick: () => { setEditing(true); setNotice('') } }, '编辑'),
               h(Button, { small: true, disabled: Boolean(busy), onClick: distill },
                 busy === 'distill' ? '提炼中…' : '重新提炼'),
               h(Button, { small: true, disabled: Boolean(busy) || !gameId, onClick: test },

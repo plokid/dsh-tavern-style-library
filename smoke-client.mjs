@@ -76,7 +76,7 @@ globalThis.window = { __ModuleLoader__: { load: definition => { factory = defini
 const source = fs.readFileSync('./client.js', 'utf8')
 // 组件都是模块内私有的，想真的渲染一次就得把它们捞出来：在工厂 return 之前
 // 挂一个探针。只改运行时用的那份字符串，源码本身不动。
-const patched = source.replace('return {\n      name: SELF,', 'globalThis.__probe = { Editor, StyleCardBlock }\n    return {\n      name: SELF,')
+const patched = source.replace('return {\n      name: SELF,', 'globalThis.__probe = { Editor, StyleCardBlock, CardEditor, cardToForm, formToCard }\n    return {\n      name: SELF,')
 assert.ok(patched !== source, '没找到工厂返回处，探针插不进去')
 // eslint-disable-next-line no-new-func
 new Function('window', 'React', patched)(globalThis.window, React)
@@ -512,7 +512,53 @@ await check('风格卡区块渲染出九个维度的内容', () => {
 await check('没有卡时给出提炼入口而不是空白', () => {
   const empty = JSON.stringify(StyleCardBlock({ ui, gameId: 'g1', libraryId: 'l1', card: null, onChanged: () => {} }))
   assert.ok(empty.includes('AI 提炼风格卡'), '空卡时没有提炼按钮')
+  assert.ok(empty.includes('粘贴一张卡'), '空卡时没有导入入口')
   assert.ok(empty.includes('9 个维度'), '没有说明卡是什么')
+})
+
+// 编辑表单是「卡 ↔ 一行一条的文本」，两头必须能对上，否则用户改完保存就把卡改坏了。
+await check('卡转表单再转回来不丢内容', () => {
+  const { cardToForm, formToCard } = globalThis.__probe || {}
+  assert.equal(typeof cardToForm, 'function', '没拿到 cardToForm')
+  assert.equal(typeof formToCard, 'function', '没拿到 formToCard')
+
+  const form = cardToForm(sampleCard)
+  assert.equal(form.dimensions.lexical, '单音节动词多')
+  assert.equal(form.laws, '每段至少一个可触的物件')
+  assert.equal(form.genes, '留白呼吸：句与句之间留空')
+  assert.equal(form.aiBan, '不由得')
+
+  const back = formToCard(form, sampleCard)
+  assert.equal(back.summary, sampleCard.summary)
+  assert.equal(back.mantra, sampleCard.mantra)
+  assert.equal(back.formula, sampleCard.formula)
+  assert.deepEqual(back.laws, sampleCard.laws)
+  assert.deepEqual(back.disallowed, sampleCard.disallowed)
+  assert.deepEqual(back.aiBan, sampleCard.aiBan)
+  assert.deepEqual(back.genes, sampleCard.genes)
+  assert.deepEqual(back.dimensions, sampleCard.dimensions)
+  // 没在表单里出现的字段要原样带回去，否则一保存就把作者/语料冲掉
+  assert.equal(back.author, sampleCard.author)
+  assert.deepEqual(back.corpus, sampleCard.corpus)
+})
+
+await check('表单里清空的条目真的会被去掉', () => {
+  const { cardToForm, formToCard } = globalThis.__probe
+  const form = cardToForm(sampleCard)
+  form.disallowed = ''
+  form.dimensions.imagery = ''
+  const back = formToCard(form, sampleCard)
+  assert.deepEqual(back.disallowed, [], '清空的禁用清单要变空')
+  assert.equal(back.dimensions.imagery, undefined, '清空的维度要从卡里去掉')
+})
+
+await check('编辑表单能渲染', () => {
+  const { CardEditor } = globalThis.__probe || {}
+  assert.equal(typeof CardEditor, 'function', '没拿到 CardEditor')
+  const tree = JSON.stringify(CardEditor({ ui, libraryId: 'l1', card: sampleCard, onSaved: () => {}, onCancel: () => {} }))
+  assert.ok(tree.includes('指纹小结'), '没有指纹小结输入')
+  assert.ok(tree.includes('写作基因'), '没有写作基因输入')
+  assert.ok(tree.includes('单音节动词多'), '没有把现有内容填进去')
 })
 
 console.log('\n结果：' + pass + ' 通过，' + fails.length + ' 失败\n')

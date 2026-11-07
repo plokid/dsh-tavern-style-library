@@ -748,6 +748,7 @@ const rawCard = {
   author: '沈从文',
   genre: '乡土小说',
   体裁: '短篇',
+  corpus: { articles: 12, chars: 18000 },
   summary: '句子短促，名词多动词少，情绪压在景物后面。',
   dimensions: {
     词汇: ['多用单音节动词，如「落」「沉」「贴」', '几乎没有形容词堆叠'],
@@ -1038,6 +1039,65 @@ await check('export-prompt 拼出可直接用的风格 Prompt', async () => {
 await check('export-prompt 在没有卡时明确拒绝', async () => {
   const lib = await cardEnv.call('save-library', { library: { name: '无卡导出库' } })
   await assert.rejects(() => cardEnv.call('export-prompt', { libraryId: lib.id }), /还没有风格卡/)
+})
+
+// 导出 → 导入 要能原样回来。这是「别人给我一张卡」唯一不用重建库的路径，
+// 也是卡的所有字段里唯一会被用户手工搬运的一次。
+await check('导出的 Prompt 能原样读回来', async () => {
+  const lib = await cardEnv.call('save-library', { library: { name: '往返库' } })
+  await cardEnv.call('card-save', { libraryId: lib.id, card: rawCard })
+  const exported = await cardEnv.call('export-prompt', { libraryId: lib.id })
+  await cardEnv.call('card-clear', { libraryId: lib.id })
+
+  const imported = await cardEnv.call('card-import', { libraryId: lib.id, text: exported.text })
+  const before = normalizeForCompare(rawCard, exported)
+  const after = imported.card
+  for (const field of ['author', 'genre', 'summary', 'mantra', 'match']) {
+    assert.equal(after[field], before[field], field + ' 没对上')
+  }
+  assert.deepEqual(after.laws, before.laws, '铁律没对上')
+  assert.deepEqual(after.disallowed, before.disallowed, '禁用清单没对上')
+  assert.deepEqual(after.aiBan, before.aiBan, 'AI 腔没对上')
+  assert.deepEqual(after.genes.map(item => item.name + '：' + item.text),
+    before.genes.map(item => item.name + '：' + item.text), '写作基因没对上')
+  for (const [key, points] of Object.entries(before.dimensions)) {
+    assert.deepEqual(after.dimensions[key], points, '维度 ' + key + ' 没对上')
+  }
+})
+
+// 只在测试里用：把原始输入按导出的口径（缺省值、排版）摊平，好逐项比较。
+// 不认识的维度键要丢掉——那正是 normalizeCard 的行为。
+function normalizeForCompare(card) {
+  const alias = { 词汇: 'lexical', 句法: 'syntactic', 语气: 'tonal', 感官: 'imagery', 对话: 'dialogue' }
+  const known = new Set(['lexical', 'syntactic', 'tonal', 'discourse', 'rhetoric', 'emotion', 'perspective', 'imagery', 'dialogue'])
+  return {
+    author: card.author || '',
+    genre: card.genre || '',
+    summary: card.summary || '',
+    mantra: card.mantra || '',
+    match: card.match || 0,
+    laws: card.laws || [],
+    disallowed: card.disallowed || [],
+    aiBan: card.aiBan || [],
+    genes: (card.genes || []).map(item => (typeof item === 'string'
+      ? { name: item.split('：')[0], text: item.split('：').slice(1).join('：') }
+      : item)),
+    dimensions: Object.fromEntries(Object.entries(card.dimensions || {})
+      .map(([key, list]) => [alias[key] || key, list])
+      .filter(([key]) => known.has(key))),
+  }
+}
+
+await check('card-import 认不出内容时给出可操作的提示', async () => {
+  const lib = await cardEnv.call('save-library', { library: { name: '乱贴库' } })
+  await assert.rejects(
+    () => cardEnv.call('card-import', { libraryId: lib.id, text: '随便一段没有任何标题的文字' }),
+    /没从这段文字里认出风格卡/,
+  )
+  await assert.rejects(
+    () => cardEnv.call('card-import', { libraryId: lib.id, text: '   ' }),
+    /先把风格卡贴进来/,
+  )
 })
 
 await check('卡能穿过来回存读（重新载入后仍在）', async () => {

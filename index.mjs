@@ -362,8 +362,129 @@ function cardPrompt(library) {
   const corpus = []
   if (card.corpus.articles) corpus.push(card.corpus.articles + ' 篇')
   if (card.corpus.chars) corpus.push(card.corpus.chars + ' 字')
-  if (corpus.length) lines.push('## 语料', corpus.join(' / ') + (card.platform ? '（' + card.platform + '）' : ''))
+  // 自评跟着语料一行走：它是这张卡上一次试写的结果，单独开一节反而更奇怪。
+  if (card.match) corpus.push('自评贴合 ' + card.match + '%')
+  if (corpus.length) {
+    lines.push('## 语料', corpus.join(' · ') + (card.platform ? '（' + card.platform + '）' : ''))
+  }
   return lines.join('\n').trim()
+}
+
+// ── 把导出的 Prompt 读回成一张卡 ──────────────────────────────
+// 和 cardPrompt() 是一对：导出的东西能原样贴回来。
+// 否则「别人给了我一张卡」只能重走一遍建库存摘录再提炼，绕得没有道理。
+const SECTION_KEYS = [
+  [/^身份/u, 'identity'],
+  [/^指纹小结/u, 'summary'],
+  [/^铁律/u, 'laws'],
+  [/^风格参考卡/u, 'dimensions'],
+  [/^写作基因/u, 'genes'],
+  [/^禁用清单/u, 'disallowed'],
+  [/^AI\s*腔/u, 'aiBan'],
+  [/^叙事公式/u, 'formula'],
+  [/^笔调标签/u, 'tags'],
+  [/^语料/u, 'corpus'],
+]
+
+function sectionKeyOf(heading) {
+  const value = str(heading).trim()
+  for (const [pattern, key] of SECTION_KEYS) if (pattern.test(value)) return key
+  return ''
+}
+
+function dimensionKeyOf(label) {
+  const value = str(label).trim()
+  const hit = CARD_DIMENSIONS.find(([, name]) => name === value)
+  if (hit) return hit[0]
+  return DIMENSION_ALIAS[value] || DIMENSION_ALIAS[value.toLowerCase()] || ''
+}
+
+function parseCardPrompt(text) {
+  const raw = str(text).replace(/\r\n?/gu, '\n')
+  if (!raw.trim()) return null
+  const card = { dimensions: {} }
+  const add = (key, value) => {
+    if (!value) return
+    if (!card[key]) card[key] = []
+    card[key].push(value)
+  }
+
+  const title = raw.match(/^#\s*写作风格\s*Prompt\s*[·・]\s*(.+)$/mu)
+  if (title) {
+    const value = title[1].trim()
+    const split = value.match(/^(.+?)[（(](.+?)[）)]$/u)
+    if (split) {
+      card.author = split[1].trim()
+      card.genre = split[2].trim()
+    } else {
+      card.author = value
+    }
+  }
+
+  let section = ''
+  let dimension = ''
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    const h3 = trimmed.match(/^###\s*(.+)$/u)
+    if (h3) {
+      dimension = dimensionKeyOf(h3[1])
+      section = dimension ? 'dimension' : ''
+      continue
+    }
+    const h2 = trimmed.match(/^##\s*(.+)$/u)
+    if (h2) {
+      section = sectionKeyOf(h2[1])
+      dimension = ''
+      continue
+    }
+    if (/^#\s/u.test(trimmed)) continue
+    // 去掉列表符号和序号；「（这张卡没有写铁律…）」这类占位说明跳过
+    const body = trimmed.replace(/^[-*]\s*/u, '').replace(/^\d+[.、)]\s*/u, '').trim()
+    if (!body || /^[（(].*[）)]$/u.test(body)) continue
+    switch (section) {
+      case 'identity': {
+        const mantra = body.match(/落笔前默念[：:]\s*(.+)$/u)
+        if (mantra) card.mantra = mantra[1].trim()
+        break
+      }
+      case 'summary':
+        card.summary = card.summary ? card.summary + ' ' + body : body
+        break
+      case 'laws': add('laws', body); break
+      case 'dimension': if (dimension) add2(card.dimensions, dimension, body); break
+      case 'genes': {
+        const split = body.match(/^(.+?)[：:]\s*(.*)$/u)
+        const gene = split ? { name: split[1].trim(), text: split[2].trim() } : { name: body, text: '' }
+        if (!card.genes) card.genes = []
+        card.genes.push(gene)
+        break
+      }
+      case 'disallowed': add('disallowed', body); break
+      case 'aiBan': add('aiBan', body); break
+      case 'formula':
+        card.formula = card.formula ? card.formula + ' ' + body : body
+        break
+      case 'corpus': {
+        const articles = body.match(/(\d+)\s*篇/u)
+        const chars = body.match(/(\d+)\s*字/u)
+        const match = body.match(/自评贴合\s*(\d{1,3})\s*%/u)
+        card.corpus = {
+          articles: articles ? Number(articles[1]) : 0,
+          chars: chars ? Number(chars[1]) : 0,
+        }
+        if (match) card.match = Number(match[1])
+        break
+      }
+      default: break
+    }
+  }
+  return normalizeCard(card)
+}
+
+function add2(map, key, value) {
+  if (!map[key]) map[key] = []
+  map[key].push(value)
 }
 
 // ── 让模型自己产出风格卡 / 盲测 ────────────────────────────────
@@ -1304,6 +1425,21 @@ export function apply(ctx, config = {}) {
     const data = await load()
     const library = libraryOf(data, libraryId)
     return { text: cardPrompt(library), name: library.name }
+  })
+
+  // 导入：把导出的 Prompt 原样贴回来（或贴一份同格式的手写卡）。
+  handle('card-import', async ({ libraryId, text } = {}) => {
+    const data = await load()
+    const library = libraryOf(data, libraryId)
+    const source = str(text).trim()
+    if (!source) throw new Error('先把风格卡贴进来再导入')
+    const card = parseCardPrompt(source)
+    if (!card) {
+      throw new Error('没从这段文字里认出风格卡：需要有「## 铁律」「### 词汇」这类标题，'
+        + '直接贴「导出 Prompt」的原文最稳。')
+    }
+    const out = await writeCard(library.id, card)
+    return { data: out.data, card: out.card, libraryId: library.id }
   })
 
   handle('analyze', async ({ gameId, text, tags } = {}) => {
