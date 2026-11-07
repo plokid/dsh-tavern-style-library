@@ -6,18 +6,19 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `index.mjs` | 宿主侧：数据读写、轮换逻辑、注入、Agent 工具、Skill 注册 |
+| `index.mjs` | 宿主侧：数据读写、轮换逻辑、注入、风格卡、Agent 工具、Skill 注册 |
 | `client.js` | 浏览器侧：侧栏面板、状态分节（`ctx.tavernUi`） |
 | `package.json` | 插件元信息，`name` 必须与浏览器侧返回的 `name` 一致 |
 | `skills/create-style-library/` | 建库用的 Agent Skill |
+| `skills/distill-style-library/` | 提炼风格卡用的 Agent Skill（含 `references/`：维度框架、叙事公式） |
 | `verify.mjs` | 宿主侧测试 |
 | `smoke-client.mjs` | 浏览器侧测试 |
 
 ## 跑测试
 
 ```sh
-node verify.mjs        # 宿主侧：切段、轮换、工具行为、注入逻辑、容错（69 项）
-node smoke-client.mjs  # 浏览器侧：模块加载、注册调用、布局与交互约定（35 项）
+node verify.mjs        # 宿主侧：切段、轮换、工具行为、注入、风格卡、容错（90 项）
+node smoke-client.mjs  # 浏览器侧：模块加载、注册调用、布局与交互约定、组件渲染（41 项）
 ```
 
 两个都用假的 `tavern` / `tavernUi` / `tools` 服务跑真实代码路径，不连真环境，也不需要装任何依赖。
@@ -43,9 +44,68 @@ node smoke-client.mjs  # 浏览器侧：模块加载、注册调用、布局与�
 - 注入的那一段每轮内容都不同，按新 token 计费。
 - 不进世界书条目池，不会诱发额外的预筛调用。
 
-`sectionText()` 同时供 `turnSection`（真正注入给模型）和 `handle('preview')`（面板展示）使用。面板只显示 `sampleText`（纯原文），因为「只借它的笔调、不要借它的情节」那段规则是给模型看的，混在预览里会让人以为规则也算样文的一部分。
+`sectionText()` 同时供 `turnSection`（真正注入给模型）和 `handle('preview')`（面板展示）使用。面板只显示 `sampleText`（纯原文）和 `cardText`（纯风格卡），因为「只借它的笔调、不要借它的情节」那段规则是给模型看的，混在预览里会让人以为规则也算样文的一部分。
 
-注入总长上限 7800 字，正常单条摘录远达不到，只有手动改 JSON 塞超长样文时才可能截断。
+一段注入里的顺序是：标题 → 规则 → 风格卡（可选）→ 参考原文（可选）。三个可选段的取舍由库的 `mode` 决定：
+
+| mode | 卡 | 原文 |
+| --- | --- | --- |
+| `sample`（默认） | — | ✅ |
+| `both` | ✅ | ✅ |
+| `card` | ✅ | — |
+
+`mode` 是**每库**的，存在库里而不是对局数据里。设成 `card` 但卡被清掉时，`cardOnly()` 为假，自动退回只用摘录——不做这个兜底，用户看到的就是「注入了空段落」。
+
+注入总长上限 7800 字。风格卡摘要单独限 2600 字（`MAX_CARD_DIGEST`），余下的空间留给摘录。正常一张卡只有几百到一千多字，够用。
+
+## 风格卡
+
+一张卡是整库一份，形状固定（`normalizeCard()` 收口）：
+
+```js
+{
+  author, genre, platform,
+  corpus: { articles, chars },
+  summary,                                   // 指纹小结 ≤ 300 字，只在面板和导出里用，不进注入
+  dimensions: { lexical: [...], ... },        // 九个维度，每维 ≤ 5 条、每条 ≤ 140 字
+  genes: [{ name, text }],                    // 写作基因 ≤ 5
+  laws: [...],                                // 铁律 ≤ 10
+  disallowed: [...],                          // 从不出现 ≤ 10
+  aiBan: [...],                               // AI 腔词表 ≤ 20
+  mantra, formula, match, updatedAt,
+}
+```
+
+三处要注意：
+
+1. **收口比校验重要。** 卡是模型写的 JSON，键名一定不规整。`DIMENSION_ALIAS` 认中英文两套键（「词汇」「lexical」「句式」「标点」「五感」「对白」都会落到对应维度），不认识的键直接丢。基因既接受 `{name, text}` 也接受 `"名称：说明"` 字符串。
+2. **「有没有卡」和「卡的内容」要分开判。** `normalizeCard()` 会补 `updatedAt`，每次调用都产生新对象；判断存在性用 `hasCard()` / `normalizeCardLite()`，只看有没有实质内容。空卡（只有 author 没有条目）一律当没有。
+3. **`card-clear` 顺手把 `mode` 改回 `sample`。** 否则面板显示「只用风格卡」却什么都不注入。
+
+三种产出方式：
+
+| 入口 | 怎么来的 | 模型调用 |
+| --- | --- | --- |
+| `handle('card-distill')` | 面板「AI 提炼」，`distillPrompt()` 取库里最多 12 段（沿全文均匀取样，不是只取开头）、每段截 700 字 | 1 次 |
+| `style_card_save` 工具 | Agent 按 `distill-style-library` 分析完自己填 | 0 次（Agent 自己就是那次调用） |
+| `card-test` | 面板「试写一段」，`blindTestPrompt()` 只给卡、不给原文，写完自评匹配度。**正文只回给面板显示，不落盘** | 1 次 |
+
+`parseCardReply()` 从回复里抠 JSON，顺序是：整段 → ```` ```json ```` 块 → 第一个 `{` 到最后一个 `}`。三层都失败才报错，并把回复前 160 字贴出来——不贴的话用户只知道「失败了」，不知道是模型跑题还是格式没跟上。
+
+`card-distill` 会把 `corpus` 按库里的真实情况覆盖一次：模型不知道你存了多少字，让它自己填一定是错的。
+
+`export-prompt` 是纯拼装、不调模型：把卡渲染成一段自包含的 Markdown，可以直接粘给任何 LLM。和注入用的 `cardDigest()` 是两个东西——后者要短，前者要全。
+
+**两张渲染的取舍**：
+
+| | `cardDigest()`（每轮注入） | `cardPrompt()`（导出） |
+| --- | --- | --- |
+| 维度 | 一行一个，分号连 | 一节一个，列表 |
+| 指纹小结 `summary` | **不写** | 写 |
+| 铁律 / 禁用 / AI 腔 | 压成紧凑的单行 | 逐条列表 |
+| 篇幅 | ≤ 2600 字 | 不限 |
+
+`summary` 不进注入是有意的：它和九个维度的条目说的是一件事，每轮重复等于把预算花两次。也正因为如此，`normalizeCard()` 和 `normalizeCardLite()` 判断「有没有卡」时都不把 `summary` 算作实质内容——只有一句小结的卡注入出去只剩一行标题。
 
 ## 数据
 
@@ -54,30 +114,40 @@ node smoke-client.mjs  # 浏览器侧：模块加载、注册调用、布局与�
 | 样文库本体 | `plugin-data/dsh-tavern-style-library.json`（Tavern 数据目录下） |
 | 本局选中 | 每局的插件数据，回退、分叉、导出存档的行为和 Tavern 其他按局数据一致 |
 
-上限：总量 256 KB（接口硬上限，插件自己在 `DATA_BUDGET = 250 * 1024` 处先拦一道，留了余量给 JSON 结构开销）、单库 40 条、60 个库、单条 40～2000 字、标签池 200 个、每条样文 12 个标签。
+上限：总量 256 KB（接口硬上限，插件自己在 `DATA_BUDGET = 250 * 1024` 处先拦一道，留了余量给 JSON 结构开销）、单库 40 条、60 个库、单条 40～2000 字、标签池 200 个、每条样文 12 个标签、每库一张风格卡 ≤ 24 KB（`MAX_CARD_BYTES`，字段上限写满约 30 KB，所以这条是兜底）。
+
+风格卡跟着库一起存在同一个 JSON 里，不是单独文件：它天然是「这个库的一部分」，分开存反而要处理两边不同步。卡超 24 KB 时 `writeCard()` 直接抛错，不做截断——截断会悄悄丢掉用户看不见的条目。
 
 **默认标签只在第一次使用时播种一次。** `normalize()` 用 `Array.isArray(src.tags)` 判断是否已经存过数据：存过就以存储为准（哪怕是空数组），没存过才用 `DEFAULT_TAGS`。早先的写法是无条件从 `DEFAULT_TAGS` 起手再合并，导致内置标签怎么删都会在下次 `persist` 时被加回来。
 
 ## Agent 工具
 
-插件注册七个工具，只在**卡片工作台**出现：
+插件注册九个工具，只在**卡片工作台**出现：
 
 | 工具 | 干什么 |
 | --- | --- |
-| `style_library_list` | 列现有库、条数、标签池。建库前先调，避免重名 |
+| `style_library_list` | 列现有库、条数、标签池、有没有风格卡。建库前先调，避免重名 |
 | `style_tags_update` | 管标签池：`add` / `set` / `remove` / `rename`。改名和删除会同步处理所有引用 |
-| `style_library_save` | 新建库或改库名／标签 |
+| `style_library_save` | 新建库或改库名／标签／`mode` |
 | `style_library_split` | 把长材料按段落切开，返回每段序号、字数和原文 |
 | `style_sample_save_many` | **批量**存多条摘录，一次 5～20 条，建库主力 |
 | `style_sample_save` | 存单条（补录或改某一条） |
 | `style_library_pick` | 把某个库设为本局使用 |
+| `style_card_get` | 读现有风格卡和注入方式。做增量修订前先调 |
+| `style_card_save` | 存一张风格卡（会覆盖旧的）。字段形状见上面「风格卡」 |
 
-配套的 [`create-style-library`](skills/create-style-library/SKILL.md) Skill 是**两阶段**的：
+两个 Skill 分工：
+
+**[`create-style-library`](skills/create-style-library/SKILL.md)** 是**两阶段**的：
 
 1. **先定标签**——读完材料自动拟 5～18 个笔调标签加进池子，列给用户看，**停下来等用户增删改**，确认后才继续。
 2. **再按标签切分**——切段、给每段定一个主标签、**同标签的段落连续排在一起**，然后批量存入。库里因此是「一种笔调一组」，轮换时同类笔调连着出现，注入的参考风格更稳。
 
 条数按材料字数算（约「字数 ÷ 1500」，2 万字要 9～15 条），沿全文铺开不要只摘开头；只摘完整段落、原文逐字照抄、标签只描述笔调不描述题材。
+
+**[`distill-style-library`](skills/distill-style-library/SKILL.md)** 用库里的摘录提炼风格卡：九个维度落数 → 合成基因／铁律／禁用／AI 腔 → `style_card_save` → 提醒改 `mode`。素材不到 3 条时它应该拒绝提炼并说明原因，而不是硬凑。
+
+`references/framework.md` 是维度定义和量化阈值（按中文小说校准过），`references/formulas.md` 是叙事公式。两份都在文件末尾保留了上游项目的 MIT 许可原文——`verify.mjs` 里那条「SKILL 提到的工具都真实存在」会扫整个 `skills/` 目录，加 Skill 时记得新 SKILL.md 里只写已注册的工具名。
 
 ## 布局的坑
 

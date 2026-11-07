@@ -64,21 +64,28 @@ const hosts = {
   'add-tag': async () => ({ data: {} }),
   analyze: async () => ({ tags: [] }),
   'set-active': async () => ({ ok: true }),
+  'card-distill': async () => ({ card: library.card }),
+  'card-test': async () => ({ card: library.card, match: 82 }),
+  'card-clear': async () => ({ data: {} }),
+  'export-prompt': async () => ({ text: '# 写作风格 Prompt' }),
 }
 
 // ── 加载插件 ─────────────────────────────────────────────────
 let factory = null
 globalThis.window = { __ModuleLoader__: { load: definition => { factory = definition.factory } } }
 const source = fs.readFileSync('./client.js', 'utf8')
+// 组件都是模块内私有的，想真的渲染一次就得把它们捞出来：在工厂 return 之前
+// 挂一个探针。只改运行时用的那份字符串，源码本身不动。
+const patched = source.replace('return {\n      name: SELF,', 'globalThis.__probe = { Editor, StyleCardBlock }\n    return {\n      name: SELF,')
+assert.ok(patched !== source, '没找到工厂返回处，探针插不进去')
 // eslint-disable-next-line no-new-func
-new Function('window', 'React', source)(globalThis.window, React)
+new Function('window', 'React', patched)(globalThis.window, React)
 
 await check('模块加载后拿到工厂函数', () => {
   assert.equal(typeof factory, 'function')
 })
 
 const plugin = factory(() => React)
-
 await check('导出名与 package.json 一致', () => {
   const pkg = JSON.parse(fs.readFileSync('./package.json', 'utf8'))
   assert.equal(plugin.name, pkg.name)
@@ -433,6 +440,79 @@ await check('删除库、删标签、删样文都走二次确认', () => {
   assert.ok(!/window\.confirm|confirm\(/.test(source), '还在用浏览器原生弹窗做确认')
   // 确认按钮是实心红底，和普通「删除」区分开
   assert.ok(/is-danger-solid/.test(source), '确认按钮和普通删除按钮样式一样')
+})
+
+await check('风格卡：编辑页有提炼入口和注入方式开关', () => {
+  // 组件本身在假 React 里跑不出交互，只校验接线与文案在，避免以后被删掉。
+  assert.ok(/function StyleCardBlock/.test(source), '没有风格卡组件')
+  assert.ok(/h\(StyleCardBlock/.test(source), '编辑页没有挂上风格卡区块')
+  assert.ok(/'card-distill'/.test(source), '没有提炼入口')
+  assert.ok(/'card-test'/.test(source), '没有试写入口')
+  assert.ok(/'export-prompt'/.test(source), '没有导出 Prompt 入口')
+  // 三种注入方式都要在
+  for (const mode of ["'sample'", "'both'", "'card'"]) {
+    assert.ok(source.includes(mode), '缺少注入方式 ' + mode)
+  }
+  // 九个维度都要有中文标签，漏一个就会在面板上少一行
+  const labels = source.slice(source.indexOf('const DIMENSION_LABELS'), source.indexOf('function StyleCardBlock'))
+  assert.equal((labels.match(/\['[a-z]+', '/g) || []).length, 9, '维度标签不是九个')
+})
+
+await check('风格卡：清除卡走二次确认', () => {
+  const part = source.slice(source.indexOf('function StyleCardBlock'), source.indexOf('// ── 样文库编辑'))
+  assert.ok(/setConfirming\(true\)/.test(part), '清除没有二次确认')
+  assert.ok(/h\(ConfirmBar/.test(part), '清除没有用确认条')
+  assert.ok(/不可恢复/.test(part), '确认里没说清后果')
+})
+
+await check('只用风格卡时不显示「换一段」', () => {
+  // 没有摘录可换，按钮留着只会点了报错
+  assert.ok(/info\.mode !== 'card'/.test(source), '没有按注入方式隐藏换一段')
+  assert.ok(/info\.card/.test(source), '状态分节没有标出风格卡')
+})
+
+// 组件跑一遍真渲染：假 React 不做 diff，但元素树是真的建出来了，
+// 字段名写错、访问 undefined、条件分支漏判都会在这里炸。
+const { Editor, StyleCardBlock } = globalThis.__probe || {}
+const sampleCard = {
+  author: '某人', genre: '武侠', corpus: { articles: 12, chars: 18000 },
+  summary: '句子短，少解释。',
+  dimensions: { lexical: ['单音节动词多'], syntactic: ['平均 11 字'], imagery: ['视觉为主'] },
+  genes: [{ name: '留白呼吸', text: '句与句之间留空' }],
+  laws: ['每段至少一个可触的物件'],
+  disallowed: ['不写内心独白'],
+  aiBan: ['不由得'],
+  mantra: '先看见，再说话。',
+  formula: '场景式：定场 → 动作 → 收在一个物件上',
+  match: 82,
+}
+const baseLibrary = { id: 'l1', name: '冷峻武侠', tags: ['冷峻'], note: '', samples: [], mode: 'sample', card: null }
+
+await check('编辑页能渲染（无卡 / 有卡）', () => {
+  assert.equal(typeof Editor, 'function', '没拿到 Editor')
+  const bare = Editor({ gameId: 'g1', ui, tags: [], library: baseLibrary, onClose: () => {}, onChanged: () => {} })
+  assert.ok(bare && typeof bare === 'object')
+  const full = Editor({ gameId: 'g1', ui, tags: [], library: { ...baseLibrary, card: sampleCard }, onClose: () => {}, onChanged: () => {} })
+  assert.ok(full && typeof full === 'object')
+  // 卡片组件要被挂进编辑页，不然提炼入口就没了
+  assert.ok(JSON.stringify(full, (key, value) => (typeof value === 'function' ? '[fn ' + value.name + ']' : value)).includes('[fn StyleCardBlock]'),
+    '编辑页没挂上风格卡区块')
+})
+
+await check('风格卡区块渲染出九个维度的内容', () => {
+  assert.equal(typeof StyleCardBlock, 'function', '没拿到 StyleCardBlock')
+  const withCard = JSON.stringify(StyleCardBlock({ ui, gameId: 'g1', libraryId: 'l1', card: sampleCard, onChanged: () => {} }))
+  for (const part of ['dsl-card', '写作基因', '铁律', '从不出现', 'AI 腔', '起笔口诀', '叙事公式', '自评 82%', '句子短，少解释']) {
+    assert.ok(withCard.includes(part), '卡片里缺少：' + part)
+  }
+  // 三个有内容的维度都要渲染出来
+  for (const label of ['词汇：', '句法：', '感官：']) assert.ok(withCard.includes(label), '缺少维度行 ' + label)
+})
+
+await check('没有卡时给出提炼入口而不是空白', () => {
+  const empty = JSON.stringify(StyleCardBlock({ ui, gameId: 'g1', libraryId: 'l1', card: null, onChanged: () => {} }))
+  assert.ok(empty.includes('AI 提炼风格卡'), '空卡时没有提炼按钮')
+  assert.ok(empty.includes('9 个维度'), '没有说明卡是什么')
 })
 
 console.log('\n结果：' + pass + ' 通过，' + fails.length + ' 失败\n')

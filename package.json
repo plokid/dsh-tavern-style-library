@@ -1,6 +1,6 @@
 {
   "name": "dsh-tavern-style-library",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "Tavern 插件：自建参考样文库，按笔调标签给正文注入文风参考；可提炼九维风格卡",
   "keywords": [

@@ -150,6 +150,23 @@ window.__ModuleLoader__.load({
       '  -webkit-line-clamp: 2; overflow: hidden; }',
       '.dsl-status-quote.is-expanded { display: block; -webkit-line-clamp: unset; }',
       '.dsl-status-quote.is-empty { cursor: default; -webkit-line-clamp: unset; opacity: .8; }',
+
+      // 风格卡：一张卡里有九个维度、基因、铁律、禁用、AI 腔，全是小字块。
+      // 用一层淡底把它们收在一起，和上下的输入框区分开。
+      '.dsl-card { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px;',
+      '  border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px;',
+      '  background: color-mix(in srgb, var(--dsh-tavern-accent) 5%, transparent); }',
+      '.dsl-card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }',
+      '.dsl-card-title { font-size: 13px; font-weight: 650; }',
+      '.dsl-card-line { margin: 0; font-size: 12px; line-height: 1.75; color: var(--dsw-alias-label-secondary);',
+      '  white-space: pre-wrap; word-break: break-word; }',
+      '.dsl-card-list { margin: 0; padding-left: 16px; font-size: 12px; line-height: 1.75;',
+      '  color: var(--dsw-alias-label-secondary); }',
+      // 导出的 Prompt 要能整段选中复制，给等宽字体、限高自己滚。
+      '.dsl-prompt { flex: none; width: 100%; box-sizing: border-box; min-height: 160px; max-height: 320px;',
+      '  border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 10px;',
+      '  background: transparent; color: var(--dsw-alias-label-secondary); resize: vertical;',
+      '  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.7; }',
     ].join('\n')
 
     function ensureStyles() {
@@ -227,10 +244,185 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // ── 风格卡 ──────────────────────────────────────────────────
+    // 一张卡是整库提炼出来的规则集：九个维度的观察、写作基因、铁律、禁用清单、
+    // AI 腔词表。摘录是「长这样」，卡是「必须这样、绝不那样」。
+    // 面板上只做三件事：展示、触发提炼/试写、导出成 Portable Prompt。
+    const DIMENSION_LABELS = [
+      ['lexical', '词汇'], ['syntactic', '句法'], ['tonal', '语气'],
+      ['discourse', '篇章'], ['rhetoric', '修辞'], ['emotion', '情感'],
+      ['perspective', '视角'], ['imagery', '感官'], ['dialogue', '对白'],
+    ]
+
+    function StyleCardBlock({ ui, gameId, libraryId, card, onChanged }) {
+      const [busy, setBusy] = useState('')
+      const [error, setError] = useState('')
+      const [notice, setNotice] = useState('')
+      const [confirming, setConfirming] = useState(false)
+      const [prompt, setPrompt] = useState('')
+      // 试写结果只活在这个组件里：模型按卡写的一段字，看完就没必要留住，
+      // 存进卡只会让它变大、并让「改卡→再试」越试越挤。
+      const [sample, setSample] = useState(null)
+
+      const run = async (label, action, args, done) => {
+        setBusy(label); setError(''); setNotice('')
+        try {
+          const result = await call(ui, action, args)
+          if (done) done(result)
+        } catch (err) { setError(message(err)) } finally { setBusy('') }
+      }
+
+      const distill = () => run('distill', 'card-distill', { gameId, libraryId }, result => {
+        if (result && result.card) onChanged(result.card)
+        setNotice('提炼完成。想让它在正文里生效，把上面的「每轮注入什么」改成「摘录＋风格卡」。')
+      })
+
+      const test = () => run('test', 'card-test', { gameId, libraryId }, result => {
+        if (result && result.card) onChanged(result.card)
+        setSample(result && result.text ? { text: result.text, match: result.match || 0 } : null)
+        setNotice('按这张卡试写了一段' + (result && result.match ? '，模型自评贴合 ' + result.match + '%' : '') + '。像不像你自己看一眼。')
+      })
+
+      const exportPrompt = () => run('export', 'export-prompt', { libraryId }, result => {
+        setPrompt(String((result && result.text) || ''))
+      })
+
+      const clear = () => run('clear', 'card-clear', { libraryId }, () => {
+        setConfirming(false)
+        setPrompt('')
+        setSample(null)
+        // 宿主把 mode 一并改回 sample 了，界面上也要跟着回，否则下拉显示的和服务端存的对不上。
+        onChanged(null, 'sample')
+        setNotice('风格卡已清除，这个库回到只用摘录。')
+      })
+
+      if (!card) {
+        return h('section', { className: 'dsh-tavern-settings-group' },
+          h('div', { className: 'dsl-section' },
+            h('div', { className: 'dsl-section-title' }, '风格卡（9 个维度）'),
+            h('p', { className: 'dsl-hint' },
+              '把整库的摘录提炼成一张卡：维度观察、写作基因、铁律、禁用清单、AI 腔词表。'
+              + '摘录告诉模型「长这样」，卡告诉它「必须这样、绝不那样」。'),
+            h('p', { className: 'dsl-hint' },
+              '用本局后台模型提炼，会产生一次调用；也可以用卡片工作台里的 Agent（说「把这个库提炼成风格卡」），'
+              + '它会按 distill-style-library 的流程分析。'),
+            h('div', { className: 'dsl-actions' },
+              h(Button, { primary: true, disabled: busy || !libraryId, onClick: distill },
+                busy === 'distill' ? '提炼中…' : 'AI 提炼风格卡'),
+            ),
+            notice ? h('p', { className: 'dsl-hint' }, notice) : null,
+            error ? h('p', { className: 'dsl-error' }, error) : null,
+          ),
+        )
+      }
+
+      const meta = [
+        card.author || '',
+        card.genre || '',
+        card.corpus && card.corpus.articles ? card.corpus.articles + ' 段' : '',
+        card.corpus && card.corpus.chars ? card.corpus.chars + ' 字' : '',
+      ].filter(Boolean).join(' · ')
+
+      return h('section', { className: 'dsh-tavern-settings-group' },
+        h('div', { className: 'dsl-section' },
+          h('div', { className: 'dsl-actions' },
+            h('div', { className: 'dsl-section-title', style: { flex: 1 } }, '风格卡'),
+            card.match ? h('span', { className: 'dsl-badge' }, '自评 ' + card.match + '%') : null,
+          ),
+          meta ? h('p', { className: 'dsl-hint' }, meta) : null,
+
+          h('div', { className: 'dsl-card' },
+            card.summary ? h('p', { className: 'dsl-card-line' }, card.summary) : null,
+
+            DIMENSION_LABELS.map(([key, label]) => {
+              const points = (card.dimensions || {})[key]
+              if (!points || !points.length) return null
+              return h('p', { key, className: 'dsl-card-line' },
+                h('b', null, label + '：'), points.join('；'))
+            }),
+
+            (card.genes || []).length
+              ? h('div', null,
+                h('p', { className: 'dsl-card-line' }, h('b', null, '写作基因')),
+                h('ul', { className: 'dsl-card-list' },
+                  card.genes.map((gene, index) => h('li', { key: index },
+                    h('b', null, gene.name), gene.text ? '：' + gene.text : '')),
+                ),
+              )
+              : null,
+
+            (card.laws || []).length
+              ? h('div', null,
+                h('p', { className: 'dsl-card-line' }, h('b', null, '铁律')),
+                h('ol', { className: 'dsl-card-list' }, card.laws.map((law, index) => h('li', { key: index }, law))),
+              )
+              : null,
+
+            (card.disallowed || []).length
+              ? h('div', null,
+                h('p', { className: 'dsl-card-line' }, h('b', null, '从不出现')),
+                h('ul', { className: 'dsl-card-list' },
+                  card.disallowed.map((item, index) => h('li', { key: index }, item))),
+              )
+              : null,
+
+            (card.aiBan || []).length
+              ? h('p', { className: 'dsl-card-line' }, h('b', null, 'AI 腔（一个都不许用）：'), card.aiBan.join('、'))
+              : null,
+
+            card.mantra ? h('p', { className: 'dsl-card-line' }, h('b', null, '起笔口诀：'), card.mantra) : null,
+            card.formula ? h('p', { className: 'dsl-card-line' }, h('b', null, '叙事公式：'), card.formula) : null,
+          ),
+
+          sample
+            ? h('div', { className: 'dsl-field' },
+              h('div', { className: 'dsl-field-label' },
+                '试写（只按卡写的）' + (sample.match ? ' · 自评 ' + sample.match + '%' : '')),
+              h('blockquote', { className: 'dsl-quote is-open' }, sample.text),
+              h('div', { className: 'dsl-actions' },
+                h(Button, { small: true, onClick: () => setSample(null) }, '收起'),
+              ),
+            )
+            : null,
+
+          prompt
+            ? h('div', { className: 'dsl-field' },
+              h('div', { className: 'dsl-field-label' }, '便携 Prompt（可直接粘给任何模型）'),
+              h('textarea', { className: 'dsl-prompt', readOnly: true, value: prompt }),
+              h('div', { className: 'dsl-actions' },
+                h(Button, { small: true, onClick: () => setPrompt('') }, '收起'),
+              ),
+            )
+            : null,
+
+          confirming
+            ? h(ConfirmBar, {
+              busy: busy === 'clear',
+              confirmLabel: '确认清除风格卡',
+              text: '清除后这个库回到只用摘录，卡里的维度观察、铁律、禁用清单都会丢掉，不可恢复。',
+              onConfirm: clear,
+              onCancel: () => setConfirming(false),
+            })
+            : h('div', { className: 'dsl-actions' },
+              h(Button, { small: true, disabled: Boolean(busy), onClick: distill },
+                busy === 'distill' ? '提炼中…' : '重新提炼'),
+              h(Button, { small: true, disabled: Boolean(busy) || !gameId, onClick: test },
+                busy === 'test' ? '试写中…' : '试写一段'),
+              h(Button, { small: true, disabled: Boolean(busy), onClick: exportPrompt },
+                busy === 'export' ? '整理中…' : '导出 Prompt'),
+              h(Button, { small: true, danger: true, disabled: Boolean(busy), onClick: () => setConfirming(true) }, '清除'),
+            ),
+
+          notice ? h('p', { className: 'dsl-hint' }, notice) : null,
+          error ? h('p', { className: 'dsl-error' }, error) : null,
+        ),
+      )
+    }
+
     // ── 样文库编辑（弹层）────────────────────────────────────────────
 
     function Editor({ gameId, ui, tags, library, onClose, onChanged }) {
-      const empty = { id: '', name: '', tags: [], note: '', samples: [] }
+      const empty = { id: '', name: '', tags: [], note: '', samples: [], mode: 'sample', card: null }
       const [draft, setDraft] = useState(() => ({ ...empty, ...(library || {}) }))
       const [tagPool, setTagPool] = useState(tags || [])
       const [sample, setSample] = useState({ id: '', text: '', source: '', tags: [] })
@@ -304,15 +496,27 @@ window.__ModuleLoader__.load({
         } catch (error) { setError(message(error)) }
       }
 
-      const saveLibrary = async () => {
+      const saveLibrary = async (override) => {
+        const payload = override ? { ...draft, ...override } : draft
         setBusy(true); setError('')
         try {
-          const result = await call(ui, 'save-library', { library: draft })
+          const result = await call(ui, 'save-library', { library: payload })
           const fresh = (result.data.libraries || []).find(item => item.id === result.id)
           if (fresh) setDraft(fresh)
           setTagPool(result.data.tags)
           if (onChanged) onChanged(result.data)
-        } catch (error) { setError(message(error)) } finally { setBusy(false) }
+          return true
+        } catch (error) { setError(message(error)); return false } finally { setBusy(false) }
+      }
+
+      // 注入方式改完立刻存：它是个开关，指望用户再点一次「保存库信息」只会漏点。
+      // 存失败要把下拉拨回去，否则界面显示的和库里存的对不上。
+      const setMode = async mode => {
+        const before = draft.mode || 'sample'
+        patch({ mode })
+        if (!draft.id) return
+        const ok = await saveLibrary({ mode })
+        if (!ok) patch({ mode: before })
       }
 
       const saveSample = async () => {
@@ -441,12 +645,38 @@ window.__ModuleLoader__.load({
               all: tagPool, value: draft.tags || [], label: '这个库的整体笔调（用于按标签挑选）',
               onChange: next => patch({ tags: next }), onNewTag: addTag,
             }),
+            // 注入方式：改完立刻生效，不用再点保存。
+            h('div', { className: 'dsl-field' },
+              h('div', { className: 'dsl-field-label' }, '每轮注入什么'),
+              h('select', {
+                className: 'dsl-select', value: draft.mode || 'sample',
+                'aria-label': '每轮注入什么',
+                onChange: event => setMode(event.target.value),
+              },
+              [['sample', '只用一段摘录（默认）'], ['both', '摘录＋风格卡'], ['card', '只用风格卡']]
+                .map(item => h('option', { key: item[0], value: item[0] }, item[1])),
+              ),
+              h('p', { className: 'dsl-hint' },
+                draft.mode === 'sample'
+                  ? '只注入原文摘录，和以前一样。提炼了风格卡之后可以换成下面两种。'
+                  : !draft.card
+                    ? '这个库还没有风格卡，现在选了也不会多注入什么——先在下面提炼一张。'
+                    : draft.mode === 'card'
+                      ? '只注入风格卡，不注入原文。适合摘录会带偏剧情、但规则想要的时候。'
+                      : '先给规则（风格卡）再给证据（原文），最稳，但每轮 token 也最多。'),
+            ),
             h('div', { className: 'dsl-actions' },
-              h(Button, { primary: true, disabled: busy, onClick: saveLibrary },
+              h(Button, { primary: true, disabled: busy, onClick: () => saveLibrary() },
                 draft.id ? '保存库信息' : '创建'),
             ),
           ),
         ),
+
+        // 风格卡：整库提炼出来的规则集，只有建好的库才谈得上
+        draft.id ? h(StyleCardBlock, {
+          ui, gameId, libraryId: draft.id, card: draft.card || null,
+          onChanged: (card, mode) => patch(mode ? { card, mode } : { card }),
+        }) : null,
 
         // 已有样文
         draft.id ? h('section', { className: 'dsh-tavern-settings-group' },
@@ -706,10 +936,15 @@ window.__ModuleLoader__.load({
       }
 
       const caption = [
-        info.total > 1 ? '第 ' + info.index + '/' + info.total + ' 段' : '',
+        // 只用风格卡时摘录不参与注入，标「第 2/4 段」只会让人以为它在轮换。
+        info.mode !== 'card' && info.total > 1 ? '第 ' + info.index + '/' + info.total + ' 段' : '',
+        info.card ? (info.mode === 'card' ? '只用风格卡' : '风格卡') : '',
         info.via === 'marker' ? '#文风 ' + info.markerTag : '',
         info.tags && info.tags.length ? info.tags.join('／') : '',
       ].filter(Boolean).join(' · ')
+
+      // 只用风格卡时没有"下一段"可换，按钮留着只会点了报错。
+      const canRotate = info.total > 1 && info.mode !== 'card'
 
       // 版式对齐原版那一节：标题行右侧「换一段」+ 两行截断的引文，点击展开。
       return h('div', { className: 'dsl-field' },
@@ -719,7 +954,7 @@ window.__ModuleLoader__.load({
             className: 'dsl-status-caption',
             title: info.source ? '来源：' + info.source : undefined,
           }, caption),
-          info.total > 1
+          canRotate
             ? h('button', {
               type: 'button', className: 'dsl-status-link', disabled: busy,
               onClick: rotate,
@@ -802,11 +1037,13 @@ window.__ModuleLoader__.load({
         const where = result.sampleTotal > 1
           ? '第 ' + result.sampleIndex + '/' + result.sampleTotal + ' 段（每轮换一段）'
           : '唯一一段'
-        // 只显示原文。result.text 是真正注入的整段（带「只借笔调」的规则说明），
+        // 卡和原文分开显示。result.text 是真正注入的整段（带「只借笔调」的规则说明），
         // 那是给模型的，摆在这里只会让人以为规则也算样文的一部分。
-        const body = result.sampleText || ''
-        return '第 ' + ((result.turn || 0) + 1) + ' 轮会用：' + result.library + ' · ' + where
-          + (result.sampleSource ? ' · ' + result.sampleSource : '') + '\n\n' + body
+        const head = '第 ' + ((result.turn || 0) + 1) + ' 轮会用：' + result.library
+          + (result.cardText ? ' · 风格卡' : '')
+          + (result.mode === 'card' ? '' : ' · ' + where)
+          + (result.sampleSource ? ' · ' + result.sampleSource : '')
+        return [head, result.cardText, result.sampleText].filter(Boolean).join('\n\n')
       }, [gameId, ui])
 
       const rotateNow = async () => {
@@ -956,7 +1193,8 @@ window.__ModuleLoader__.load({
                     ),
                     on ? h('span', { className: 'dsl-badge' }, '正在用') : null,
                     h(Button, {
-                      small: true, primary: !on, disabled: pickBusy || (library.samples || []).length === 0,
+                      small: true, primary: !on,
+                      disabled: pickBusy || ((library.samples || []).length === 0 && !library.card),
                       onClick: () => pick(library.id, ''),
                     }, on ? '保留' : '用这个'),
                   ),
@@ -1157,6 +1395,8 @@ window.__ModuleLoader__.load({
 
         h('p', { className: 'dsl-hint' },
           '这里存你自己的小说摘录，按笔调归档。选中一个库后，每轮正文都会带上它的一段样文做笔调参考，并在库内逐轮轮换。'),
+        h('p', { className: 'dsl-hint' },
+          '攒够摘录后，可以在库里提炼一张「风格卡」：九个维度的观察、写作基因、铁律、禁用清单。开了它，注入的就是规则加证据。'),
         h('p', { className: 'dsl-hint is-warn' },
           '同时开着本局的「文风联想」会注入两段笔调参考，建议关掉其中一个。'),
 
@@ -1188,7 +1428,10 @@ window.__ModuleLoader__.load({
                     h('div', { className: 'dsl-item-copy' },
                       h('div', { className: 'dsl-item-title' }, library.name),
                       h('div', { className: 'dsl-item-meta' },
-                        ((library.tags || []).join('／') || '未设笔调标签') + ' · ' + count + ' 条'),
+                        ((library.tags || []).join('／') || '未设笔调标签') + ' · ' + count + ' 条'
+                        + (library.card
+                          ? ' · 风格卡' + (library.card.match ? ' ' + library.card.match + '%' : '')
+                          : '')),
                       library.note ? h('div', { className: 'dsl-item-meta' }, library.note) : null,
                       matched
                         ? h('div', { className: 'dsl-item-meta' }, '样文中有 ' + matched + ' 条命中')
@@ -1208,7 +1451,7 @@ window.__ModuleLoader__.load({
                     })
                     : h('div', { className: 'dsl-actions is-tight' },
                       h(Button, {
-                        small: true, primary: !on, disabled: busy || count === 0,
+                        small: true, primary: !on, disabled: busy || (count === 0 && !library.card),
                         onClick: () => useLibrary(on ? '' : library.id),
                       }, on ? '取消' : '本局使用'),
                       h(Button, { small: true, onClick: () => openEditor(library) }, '编辑'),
