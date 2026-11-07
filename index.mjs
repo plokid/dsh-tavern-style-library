@@ -45,7 +45,65 @@ export const DEFAULT_TAGS = [
 // 正文里写 #文风 冷峻 —— 本轮临时指定笔调，优先级高于本局选中。
 const MARKER = /#文风\s*[:：]?\s*([^\s#，,。;；!！?？、]+)/u
 
+// ── 风格卡（7+1 维度提炼）────────────────────────────────────────
+//
+// 融合 perfectly-replicate-writing-skills 的分析框架（MIT，见
+// skills/distill-style-library/references/framework.md）：把一整个库的摘录
+// 提炼成一张「可执行的风格卡」——七个维度的量化观察、跨维度验证过的写作基因、
+// 铁律、以及「从不出现」的禁用清单。摘录是原文证据，风格卡是规则；两者一起
+// 注入，模型既有样子可看，也有边界可守。
+const CARD_DIMENSIONS = [
+  ['lexical', '词汇'],
+  ['syntactic', '句法'],
+  ['tonal', '语气'],
+  ['discourse', '篇章'],
+  ['rhetoric', '修辞'],
+  ['emotion', '情感'],
+  ['perspective', '视角'],
+  // 下面两项来自 fiction-distiller 的「五感权重 / 人物与对话」：写小说时它们比
+  // 抽象的「修辞」更能决定像不像——一段文字有没有具体的冷热、有没有人真的在说话。
+  ['imagery', '感官'],
+  ['dialogue', '对白'],
+]
+const DIMENSION_ALIAS = {
+  词汇: 'lexical', 词汇特征: 'lexical', lexical: 'lexical',
+  句法: 'syntactic', 句法特征: 'syntactic', 句式: 'syntactic', 标点: 'syntactic', syntactic: 'syntactic',
+  语气: 'tonal', 语气特征: 'tonal', 调性: 'tonal', tonal: 'tonal',
+  篇章: 'discourse', 篇章结构: 'discourse', 结构: 'discourse', 节奏: 'discourse', discourse: 'discourse',
+  修辞: 'rhetoric', 修辞表达: 'rhetoric', 修辞系统: 'rhetoric', rhetoric: 'rhetoric',
+  情感: 'emotion', 情感态度: 'emotion', 情绪: 'emotion', 氛围: 'emotion', emotion: 'emotion',
+  视角: 'perspective', 内容视角: 'perspective', 叙事视角: 'perspective', perspective: 'perspective',
+  感官: 'imagery', 五感: 'imagery', 意象: 'imagery', 描写: 'imagery', imagery: 'imagery',
+  对白: 'dialogue', 对话: 'dialogue', 人物: 'dialogue', dialogue: 'dialogue',
+}
+const MAX_CARD_POINTS = 5
+const MAX_CARD_POINT_CHARS = 140
+const MAX_CARD_GENES = 5
+const MAX_CARD_LAWS = 10
+const MAX_CARD_DISALLOWED = 10
+const MAX_CARD_ITEM_CHARS = 120
+const MAX_CARD_MANTRA = 200
+const MAX_CARD_SUMMARY = 300
+const MAX_CARD_AI_BAN = 20
+const MAX_CARD_AI_BAN_CHARS = 24
+// 试写只返回给面板显示，不存进卡：它是一次校验，不是资产。
+// 存进去会让「改卡 → 再试」的循环不断撞字节上限，收益却只是下次打开还能看到。
+// 这个数字只用来限制返回给面板的长度。
+const MAX_CARD_TESTED = 800
+const MAX_CARD_DIGEST = 2600
+// 字段上限写满约 30 KB，这里留 24 KB 当兜底：
+// 正常一张卡两三 KB，写满还能存的卡基本已经是一堆废话了。
+const MAX_CARD_BYTES = 24 * 1024
+// 每轮注入什么：只用摘录（默认，和以前一致）/ 摘录 + 风格卡 / 只用风格卡。
+const CARD_MODES = ['sample', 'both', 'card']
+
 const str = value => (typeof value === 'string' ? value : '')
+
+const clampInt = (value, min, max) => {
+  const num = Number(value)
+  if (!Number.isFinite(num)) return min
+  return Math.min(max, Math.max(min, Math.trunc(num)))
+}
 
 function newId() {
   return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4)
@@ -85,6 +143,343 @@ function cleanSamples(value) {
   return out
 }
 
+// ── 风格卡的归一化 ───────────────────────────────────────────
+// 风格卡是由模型（AI 提炼）或 Agent 写出来的 JSON，形状一定不会完全规整：
+// 键名中英混着、数组里混着字符串和对象、条目多到放不下。这里统一收一遍，
+// 收到的永远是一个固定形状的对象，后面的渲染和注入就不用再操心。
+
+const squeeze = (value, max) => {
+  const text = str(value).replace(/\s+/gu, ' ').trim()
+  return text.length > max ? text.slice(0, max) : text
+}
+
+/** 把「字符串或字符串数组」收成去重后的字符串数组；也接受 {text/point/…} 对象。 */
+function cardList(value, max, maxChars) {
+  let list
+  if (Array.isArray(value)) list = value
+  else if (typeof value === 'string') list = value.split(/\n+|；|;/u)
+  else list = []
+  const out = []
+  for (const item of list) {
+    const raw = item && typeof item === 'object'
+      ? (item.text ?? item.point ?? item.value ?? item.finding ?? item.desc ?? item.description ?? item.label ?? item.name ?? '')
+      : item
+    const text = squeeze(raw, maxChars)
+    if (!text || out.includes(text)) continue
+    out.push(text)
+    if (out.length >= max) break
+  }
+  return out
+}
+
+function cardDimensions(value) {
+  const src = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+  const out = {}
+  for (const [key, points] of Object.entries(src)) {
+    const raw = str(key).trim()
+    const name = DIMENSION_ALIAS[raw] || DIMENSION_ALIAS[raw.toLowerCase()]
+    if (!name || out[name]) continue
+    const list = cardList(points, MAX_CARD_POINTS, MAX_CARD_POINT_CHARS)
+    if (list.length) out[name] = list
+  }
+  return out
+}
+
+function cardGenes(value) {
+  const out = []
+  const source = Array.isArray(value) ? value : (value && typeof value === 'string' ? [value] : [])
+  for (const item of source) {
+    let name = ''
+    let text = ''
+    if (item && typeof item === 'object') {
+      name = squeeze(item.name ?? item.title ?? '', 24)
+      text = squeeze(item.text ?? item.desc ?? item.description ?? item.detail ?? '', MAX_CARD_POINT_CHARS)
+    } else {
+      const raw = squeeze(item, MAX_CARD_POINT_CHARS + 24)
+      const cut = raw.search(/[：:]/u)
+      if (cut > 0 && cut <= 24) {
+        name = squeeze(raw.slice(0, cut), 24)
+        text = squeeze(raw.slice(cut + 1), MAX_CARD_POINT_CHARS)
+      } else {
+        text = raw
+      }
+    }
+    if (!name && !text) continue
+    out.push({ name: name || '写作基因' + (out.length + 1), text })
+    if (out.length >= MAX_CARD_GENES) break
+  }
+  return out
+}
+
+function normalizeCard(raw) {
+  const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null
+  if (!src) return null
+  const corpusRaw = src.corpus && typeof src.corpus === 'object' ? src.corpus : {}
+  const card = {
+    author: squeeze(src.author ?? src.name ?? '', 40),
+    genre: squeeze(src.genre ?? src['体裁'] ?? '', 40),
+    platform: squeeze(src.platform ?? src['平台'] ?? '', 40),
+    corpus: {
+      articles: clampInt(corpusRaw.articles ?? src.articles, 0, 999),
+      chars: clampInt(corpusRaw.chars ?? corpusRaw.words ?? src.chars, 0, 99999999),
+    },
+    // 维度既可能收在 dimensions 里，也可能被平铺在根上（模型常这么写）；
+    // cardDimensions 只认那九个键，多给的 author/genre 之类会被忽略。
+    dimensions: cardDimensions(src.dimensions ?? src['维度'] ?? src),
+    genes: cardGenes(src.genes ?? src['写作基因']),
+    laws: cardList(src.laws ?? src.ironLaws ?? src.rules ?? src['铁律'], MAX_CARD_LAWS, MAX_CARD_ITEM_CHARS),
+    disallowed: cardList(
+      src.disallowed ?? src.never ?? src['禁用清单'] ?? src['禁用'] ?? src['反面清单'],
+      MAX_CARD_DISALLOWED, MAX_CARD_ITEM_CHARS,
+    ),
+    // AI 腔黑名单：比「禁用动作」更细，是具体的词和套话。fiction-distiller 那套
+    // 反 AI 痕迹的做法里最有用的一条——模型最容易在这里露馅。
+    aiBan: cardList(
+      src.aiBan ?? src.aiWords ?? src['AI腔'] ?? src['AI词'] ?? src['黑名单'],
+      MAX_CARD_AI_BAN, MAX_CARD_AI_BAN_CHARS,
+    ),
+    summary: squeeze(src.summary ?? src['指纹小结'] ?? src['小结'] ?? '', MAX_CARD_SUMMARY),
+    mantra: squeeze(src.mantra ?? src['口诀'] ?? src['起笔口诀'] ?? '', MAX_CARD_MANTRA),
+    formula: squeeze(src.formula ?? src['公式'] ?? '', 60),
+    match: clampInt(src.match ?? src.score ?? src['匹配度'], 0, 100),
+    updatedAt: Number(src.updatedAt) || Date.now(),
+  }
+  // 一张什么实质内容都没有的卡等于没有卡——不要拿它去注入。
+  // `summary` 不算实质内容：它只是转述，单独存在的话注入出去只有一行标题。
+  const meaningful = Object.keys(card.dimensions).length > 0 || card.genes.length > 0
+    || card.laws.length > 0 || card.disallowed.length > 0 || card.aiBan.length > 0
+    || Boolean(card.mantra)
+  return meaningful ? card : null
+}
+
+function cardBytes(card) {
+  return Buffer.byteLength(JSON.stringify(card))
+}
+
+const hasCard = card => Boolean(card && normalizeCardLite(card))
+
+// normalizeCard 会补 updatedAt，判断「有没有卡」只需要看实质内容。
+function normalizeCardLite(card) {
+  if (!card || typeof card !== 'object') return null
+  const dims = card.dimensions && typeof card.dimensions === 'object' ? Object.keys(card.dimensions).length : 0
+  const ok = dims > 0 || (card.genes || []).length > 0 || (card.laws || []).length > 0
+    || (card.disallowed || []).length > 0 || (card.aiBan || []).length > 0
+    || Boolean(card.mantra)
+  return ok ? card : null
+}
+
+// 这张卡给模型看的时候长什么样：一行维度一句，基因、铁律、禁用各一段。
+// 有意做得比导出的 Prompt 短——它要和摘录挤在同一段注入里。
+function cardDigest(card) {
+  if (!hasCard(card)) return ''
+  const meta = []
+  if (card.author) meta.push(card.author)
+  if (card.corpus && card.corpus.articles) meta.push(card.corpus.articles + ' 篇')
+  if (card.corpus && card.corpus.chars) meta.push(Number(card.corpus.chars).toLocaleString('zh-CN') + ' 字')
+  if (card.match) meta.push('自评贴合 ' + card.match + '%')
+  // 不塞 summary。那句指纹小结是给人和导出的 Prompt 看的，和下面的维度条目
+  // 说的是同一件事；每轮都重复一遍，只是把 300 字预算花了两次。
+  // 也不在标题里再解释一遍「规则/证据」——上一行的规则说明刚说完。
+  const lines = ['■ 风格卡' + (meta.length ? '（' + meta.join(' · ') + '）' : '')]
+  for (const [key, label] of CARD_DIMENSIONS) {
+    const points = card.dimensions && card.dimensions[key]
+    if (points && points.length) lines.push(label + '：' + points.join('；'))
+  }
+  if (card.genes && card.genes.length) {
+    lines.push('写作基因：' + card.genes.map((gene, index) =>
+      (index + 1) + ') ' + gene.name + (gene.text ? ' — ' + gene.text : '')).join('｜'))
+  }
+  if (card.laws && card.laws.length) {
+    lines.push('铁律：' + card.laws.map((law, index) => (index + 1) + '. ' + law).join(' '))
+  }
+  if (card.disallowed && card.disallowed.length) {
+    lines.push('从不出现（写出来就是出戏）：' + card.disallowed.join('；'))
+  }
+  if (card.aiBan && card.aiBan.length) {
+    lines.push('AI 腔（一个都不许用）：' + card.aiBan.join('、'))
+  }
+  if (card.mantra) lines.push('起笔口诀：' + card.mantra)
+  const text = lines.join('\n')
+  return text.length > MAX_CARD_DIGEST ? text.slice(0, MAX_CARD_DIGEST) + '…' : text
+}
+
+/** 状态页用的一行提要：没有摘录可显示时，用它顶替引文位置。 */
+function cardBrief(card) {
+  if (!hasCard(card)) return ''
+  const bits = []
+  for (const [key, label] of CARD_DIMENSIONS) {
+    const points = card.dimensions && card.dimensions[key]
+    if (points && points.length) bits.push(label + ' ' + points[0])
+    if (bits.length >= 3) break
+  }
+  return bits.length ? bits.join('；') : (card.mantra || (card.genes && card.genes[0] ? card.genes[0].name : '') || '')
+}
+
+// 导出的「便携风格 Prompt」：给任何 LLM 都能直接用，不依赖本插件。
+// 外面传进来的卡不一定过过 normalize（手改 JSON、老数据都算），所以这里再收一次口。
+function cardPrompt(library) {
+  if (!hasCard(library && library.card)) {
+    throw new Error('这个样文库还没有风格卡，先提炼一张（AI 提炼，或让 Agent 用 style_card_save 存）。')
+  }
+  const card = normalizeCard(library.card)
+  if (!card) throw new Error('这张风格卡读不出来（结构不对），重新提炼一次。')
+  const who = card.author || library.name
+  const lines = [
+    '# 写作风格 Prompt · ' + who + (card.genre ? '（' + card.genre + '）' : ''),
+    '',
+    '## 身份',
+    '你是一位' + (card.genre || '小说') + '写作者，笔调参照「' + who + '」。' + (card.mantra ? '落笔前默念：' + card.mantra : ''),
+  ]
+  if (card.summary) lines.push('', '## 指纹小结', card.summary)
+  lines.push('', '## 铁律')
+  if (card.laws.length) card.laws.forEach((law, index) => lines.push((index + 1) + '. ' + law))
+  else lines.push('（这张卡没有写铁律，按下面的维度观察落笔。）')
+  lines.push('', '## 风格参考卡')
+  for (const [key, label] of CARD_DIMENSIONS) {
+    const points = card.dimensions[key]
+    if (!points || !points.length) continue
+    lines.push('### ' + label)
+    for (const point of points) lines.push('- ' + point)
+    lines.push('')
+  }
+  if (card.genes.length) {
+    lines.push('## 写作基因（跨维度验证过，删掉就不像了）')
+    card.genes.forEach((gene, index) => lines.push((index + 1) + '. ' + gene.name + (gene.text ? '：' + gene.text : '')))
+    lines.push('')
+  }
+  if (card.disallowed.length) {
+    lines.push('## 禁用清单')
+    for (const item of card.disallowed) lines.push('- ' + item)
+    lines.push('')
+  }
+  if (card.aiBan.length) {
+    lines.push('## AI 腔黑名单（一个都不许出现）')
+    for (const item of card.aiBan) lines.push('- ' + item)
+    lines.push('')
+  }
+  if (card.formula) lines.push('## 叙事公式', card.formula, '')
+  if (library.tags && library.tags.length) lines.push('## 笔调标签', library.tags.join('／'), '')
+  const corpus = []
+  if (card.corpus.articles) corpus.push(card.corpus.articles + ' 篇')
+  if (card.corpus.chars) corpus.push(card.corpus.chars + ' 字')
+  if (corpus.length) lines.push('## 语料', corpus.join(' / ') + (card.platform ? '（' + card.platform + '）' : ''))
+  return lines.join('\n').trim()
+}
+
+// ── 让模型自己产出风格卡 / 盲测 ────────────────────────────────
+// 取材要沿全文铺开：只喂开头几段，提炼出来的是「开头那一段的笔调」。
+function cardSource(library, max = 12, perSample = 700) {
+  const samples = library.samples || []
+  if (samples.length <= max) return samples.map(item => item.text.slice(0, perSample))
+  const step = samples.length / max
+  return Array.from({ length: max }, (_, index) => samples[Math.floor(index * step)].text.slice(0, perSample))
+}
+
+function distillPrompt(library) {
+  const picked = cardSource(library)
+  const chars = picked.reduce((sum, text) => sum + text.length, 0)
+  return [
+    '你是文体分析员。下面是同一批材料里摘出的 ' + picked.length + ' 段原文（合计约 ' + chars + ' 字），',
+    '请按 9 个维度提炼出一张可执行的写作风格卡，供别人照着写同一副笔调。',
+    '',
+    '原则：',
+    '- 只描述这批文字**实际呈现**的特征；不评价好坏，不给通用写作建议。',
+    '- 能量化就量化。「喜欢用短句」没有信息量；「平均 11 字，七成句子在 8 字以内」有用。',
+    '- 反复出现 3 次以上的才算特征。只出现一两次的是即兴，不要写进来。',
+    '- 材料里互相矛盾的地方**保留矛盾**，不要抹平。',
+    '- 不要猜作者生平、写作意图，也不要拿别的作家来类比。',
+    '- 铁律要能自检：写完回头看一眼就知道有没有做到，不要写「要生动」这种没法判的。',
+    '- 禁用清单写「这段文字从不做的事」，具体到句式、词、动作——它比正面特征更能定边界。',
+    '- AI 腔单列一份词表：这批文字里根本不会出现的套话，最多 20 个。',
+    '',
+    // runTask 跑的是本局的后台 Agent，前缀里带着人物卡和世界观。
+    // 不显式切掉的话，模型会把「这一局是什么故事」混进「这批材料什么笔调」里。
+    '忽略本局的人物卡、世界观和剧情，它们与这批材料无关。',
+    '',
+    '只输出一个 JSON 对象，不要解释，不要代码块：',
+    '{',
+    '  "author": "作者或书名，不知道就留空",',
+    '  "genre": "体裁",',
+    '  "corpus": { "articles": 篇数, "chars": 字数 },',
+    '  "summary": "300 字以内的指纹小结：一口气说清这副笔调是什么样",',
+    '  "dimensions": {',
+    '    "lexical": ["3-5 条：高频词、指纹词、搭配、用词质感"],',
+    '    "syntactic": ["3-5 条：平均句长、长短句分布、标点指纹、段落节奏"],',
+    '    "tonal": ["3-5 条：口语化程度、冷热、断言强弱、句长波动"],',
+    '    "discourse": ["3-5 条：开头怎么起、场景怎么推进、在哪收"],',
+    '    "rhetoric": ["3-5 条：比喻密度与取材、排比、设问、具体与抽象的比例"],',
+    '    "emotion": ["3-5 条：情绪极性、弧线、克制度"],',
+    '    "perspective": ["3-5 条：人称、聚焦方式、价值词"],',
+    '    "imagery": ["3-5 条：视觉/听觉/触觉各占多少，有没有通感"],',
+    '    "dialogue": ["3-5 条：对白多长、有没有提示语、人物怎么用词区分"]',
+    '  },',
+    '  "genes": [{ "name": "4-6 字", "text": "一句话，说清它由哪几个维度共同支撑" }],',
+    '  "laws": ["6-10 条铁律：落到操作层，能直接照着写、也能自检"],',
+    '  "disallowed": ["5-10 条：这段文字从不出现的东西"],',
+    '  "aiBan": ["AI 腔词句黑名单，最多 20 个"],',
+    '  "mantra": "30 字以内的起笔口诀",',
+    '  "formula": "如果要套一个叙事公式，推荐哪个、为什么"',
+    '}',
+    '',
+    '原文开始',
+    '"""',
+    ...picked.map((text, index) => '【第 ' + (index + 1) + ' 段】\n' + text),
+    '"""',
+    '原文结束',
+  ].join('\n')
+}
+
+function blindTestPrompt(library) {
+  const card = library.card
+  return [
+    '按下面这张风格卡，写一段 200～300 字的叙事片段。',
+    '不要提到风格卡，不要解释你在做什么，直接写正文。写完再自评贴合度。',
+    // 同上：别把本局的人物卡和剧情带进来，否则写出来是「这一局」的样子，不是「这张卡」的样子。
+    '这段只是试写，不要使用本局的人物、地名和已发生的剧情，也不要续写。',
+    '',
+    cardDigest(card),
+    '',
+    '输出格式，严格照此：',
+    '【试写】',
+    '（正文）',
+    '【自评】',
+    '（逐维度一句话，说明哪里像、哪里不像）',
+    '综合匹配度：82%',
+  ].join('\n')
+}
+
+// 从模型回复里抠 JSON：整段就是 JSON 最好，不行就从 ```json 块或第一个大括号起截。
+function parseCardReply(text) {
+  const raw = str(text).trim()
+  if (!raw) return null
+  const candidates = []
+  candidates.push(raw)
+  const fence = raw.match(/```(?:json)?\s*\n([\s\S]*?)```/u)
+  if (fence) candidates.push(fence[1])
+  const start = raw.indexOf('{')
+  const end = raw.lastIndexOf('}')
+  if (start >= 0 && end > start) candidates.push(raw.slice(start, end + 1))
+  for (const candidate of candidates) {
+    try {
+      const value = JSON.parse(candidate)
+      const card = normalizeCard(value)
+      if (card) return card
+    } catch { /* 试下一个候选 */ }
+  }
+  return null
+}
+
+function parseTestReply(text) {
+  const raw = str(text).trim()
+  const score = Number((raw.match(/匹配度[^\d]{0,6}(\d{1,3})/u) || [])[1])
+  const mark = raw.indexOf('【自评】')
+  const body = (mark > 0 ? raw.slice(0, mark) : raw)
+    .replace(/【试写】/gu, '')
+    .trim()
+    .slice(0, MAX_CARD_TESTED)
+  return { text: body, match: Number.isFinite(score) ? Math.min(100, score) : 0 }
+}
+
 function normalize(raw) {
   const src = raw && typeof raw === 'object' ? raw : {}
   // 默认标签只在**第一次使用**（还没有任何数据）时播种一次。
@@ -113,6 +508,9 @@ function normalize(raw) {
       tags: cleanTags(item.tags),
       note: str(item.note).trim().slice(0, 200),
       samples: cleanSamples(item.samples),
+      // 风格卡：老数据没有这一项，读出来就是 null，行为和以前完全一样。
+      card: normalizeCard(item.card),
+      mode: CARD_MODES.includes(str(item.mode)) ? str(item.mode) : 'sample',
       createdAt: Number(item.createdAt) || Date.now(),
       updatedAt: Number(item.updatedAt) || Date.now(),
     })
@@ -160,12 +558,25 @@ function resolveByTag(data, tag, seed, extra = 0) {
   return {}
 }
 
+/** 这个库是不是「只用风格卡」——设成 card 但卡被清掉时要退回摘录。 */
+const cardOnly = library => Boolean(library && hasCard(library.card) && library.mode === 'card')
+/** 这一轮到底会不会把风格卡带进去。 */
+const usesCard = library => Boolean(library && hasCard(library.card) && library.mode !== 'sample')
+
 function sectionText(library, sample) {
-  const head = '【文风参考 · ' + library.name + (sample.tags.length ? ' · ' + sample.tags.join('／') : '') + '】'
-  const rule = '下面这段是参考原文，只借它的笔调：句子的长短与节奏、留白的位置、用词的质感和克制程度。'
+  const withCard = usesCard(library)
+  const onlyCard = cardOnly(library)
+  const tags = []
+  if (sample && sample.tags.length) tags.push(sample.tags.join('／'))
+  if (withCard) tags.push('风格卡')
+  const head = '【文风参考 · ' + library.name + (tags.length ? ' · ' + tags.join(' · ') : '') + '】'
+  const rule = '只借它的笔调：句子的长短与节奏、留白的位置、用词的质感和克制程度。'
+    + (withCard && !onlyCard ? '风格卡给的是规则，原文给的是证据，两样都以笔调为准。' : '')
     + '\n不要借它的情节、人物、名字，不要照抄任何原句，也不要在正文里提到它或它的出处。'
-  const body = '参考原文：\n' + sample.text
-  const text = [head, rule, body].join('\n')
+  const parts = [head, rule]
+  if (withCard) parts.push(cardDigest(library.card))
+  if (!onlyCard && sample) parts.push('参考原文：\n' + sample.text)
+  const text = parts.join('\n')
   return text.length > MAX_SECTION_CHARS ? text.slice(0, MAX_SECTION_CHARS) : text
 }
 
@@ -282,7 +693,8 @@ export function apply(ctx, config = {}) {
     const data = normalize(next)
     const bytes = Buffer.byteLength(JSON.stringify(data))
     if (bytes > DATA_BUDGET) {
-      throw new Error('样文库接近 256 KB 上限（当前 ' + Math.round(bytes / 1024) + ' KB）：请删掉一些样文，或缩短单条样文。')
+      throw new Error('样文库接近 256 KB 上限（当前 ' + Math.round(bytes / 1024)
+        + ' KB）：请删掉一些样文、缩短单条样文，或清掉几个不用的风格卡。')
     }
     await tavern.savePluginData({ data })
     cached = data
@@ -334,12 +746,17 @@ export function apply(ctx, config = {}) {
     const marker = MARKER.exec(str(input))
     if (marker) {
       const hit = resolveByTag(data, marker[1], seed, active.shift)
-      if (hit.library && hit.sample) return { library: hit.library, sample: hit.sample, via: 'marker' }
+      // 能不能用不能只看 sample：库里的摘录被删光、但还留着风格卡时，
+      // 「摘录＋风格卡」这一档应该退化成只注入卡，而不是整段消失。
+      if (hit.library && (hit.sample || usesCard(hit.library))) {
+        return { library: hit.library, sample: hit.sample || null, via: 'marker' }
+      }
     }
     const library = data.libraries.find(item => item.id === active.libraryId)
     if (!library) return null
     const sample = sampleFor(library, active.sampleId, seed, active.shift)
-    return sample ? { library, sample, via: 'active' } : null
+    if (sample || usesCard(library)) return { library, sample: sample || null, via: 'active' }
+    return null
   }
 
   // ── 存储操作：面板和 Agent 工具共用 ──────────────────────────────
@@ -348,6 +765,7 @@ export function apply(ctx, config = {}) {
       ...item,
       tags: [...item.tags],
       samples: item.samples.map(sample => ({ ...sample, tags: [...sample.tags] })),
+      card: item.card ? JSON.parse(JSON.stringify(item.card)) : null,
     }))
   }
 
@@ -358,11 +776,15 @@ export function apply(ctx, config = {}) {
     const data = await load()
     const next = { ...data, libraries: cloneLibraries(data) }
     const existing = next.libraries.find(item => item.id === str(source.id))
+    // mode 只在显式给出时改；Agent 的 style_library_save 不带 mode 时不能把用户设的模式冲掉。
+    const wantedMode = CARD_MODES.includes(str(source.mode)) ? str(source.mode) : ''
     let id
     if (existing) {
       existing.name = name
       existing.tags = cleanTags(source.tags)
       existing.note = str(source.note).trim().slice(0, 200)
+      if (wantedMode) existing.mode = wantedMode
+      if (source.card !== undefined) existing.card = normalizeCard(source.card)
       existing.updatedAt = Date.now()
       id = existing.id
     } else {
@@ -376,6 +798,8 @@ export function apply(ctx, config = {}) {
         tags: cleanTags(source.tags),
         note: str(source.note).trim().slice(0, 200),
         samples: [],
+        card: normalizeCard(source.card),
+        mode: wantedMode || 'sample',
         createdAt: Date.now(),
         updatedAt: Date.now(),
       })
@@ -487,6 +911,9 @@ export function apply(ctx, config = {}) {
       tags: library.tags,
       note: library.note,
       count: library.samples.length,
+      mode: library.mode,
+      hasCard: hasCard(library.card),
+      cardMatch: library.card ? library.card.match : 0,
     }
   }
 
@@ -566,6 +993,60 @@ export function apply(ctx, config = {}) {
     }
 
     throw new Error('不认识的操作：' + action)
+  }
+
+  // ── 风格卡的读写 ────────────────────────────────────────────
+  // 卡是整库一份，跟库一起存（plugin-data 里），不进按局数据：
+  // 换一局、回退到哪一轮，用的都是同一张卡，不需要按版本管理。
+  async function writeCard(libraryId, rawCard) {
+    const card = normalizeCard(rawCard)
+    if (!card) {
+      throw new Error('风格卡是空的：至少要给出维度观察、写作基因、铁律、禁用清单里的任意一项')
+    }
+    const bytes = cardBytes(card)
+    if (bytes > MAX_CARD_BYTES) {
+      throw new Error('风格卡太长（' + Math.round(bytes / 1024) + ' KB，上限 '
+        + Math.round(MAX_CARD_BYTES / 1024) + ' KB）：删掉几条再存')
+    }
+    const data = await load()
+    const next = { ...data, libraries: cloneLibraries(data) }
+    const library = next.libraries.find(item => item.id === str(libraryId))
+    if (!library) throw new Error('没有这个样文库')
+    library.card = card
+    library.updatedAt = Date.now()
+    const saved = await persist(next)
+    return { data: saved, card }
+  }
+
+  async function clearCard(libraryId) {
+    const data = await load()
+    const next = { ...data, libraries: cloneLibraries(data) }
+    const library = next.libraries.find(item => item.id === str(libraryId))
+    if (!library) throw new Error('没有这个样文库')
+    library.card = null
+    // 卡没了，模式也得跟着回到只用摘录，否则面板显示「只用风格卡」却什么都不注入。
+    library.mode = 'sample'
+    library.updatedAt = Date.now()
+    return { data: await persist(next) }
+  }
+
+  function libraryOf(data, wanted) {
+    const key = str(wanted).trim()
+    if (!key) throw new Error('要指定样文库名或 id')
+    const library = data.libraries.find(item => item.id === key) || data.libraries.find(item => item.name === key)
+    if (!library) throw new Error('没有样文库「' + key + '」')
+    return library
+  }
+
+  /** 调本局后台模型跑一次，拿回一段文本。 */
+  async function runPrompt(gameId, prompt) {
+    if (!str(gameId)) throw new Error('这一步需要一个打开的对局（后台模型按局配置）')
+    try {
+      const result = await tavern.runTask({ gameId: str(gameId), prompt })
+      return str(result && result.text)
+    } catch (error) {
+      throw new Error('调用后台模型失败：' + (error && error.message ? error.message : error) + '（这一局需要在设置里配置后台模型）')
+    }
   }
 
   // 每轮算一次；内容变化不影响缓存前缀，因为它本来就属于本轮上下文。
@@ -676,6 +1157,9 @@ export function apply(ctx, config = {}) {
     if (!library || library.samples.length === 0) {
       return { ok: false, text: '本局还没选样文库，先去侧栏选一个。' }
     }
+    if (cardOnly(library)) {
+      return { ok: false, text: '这个库设成「只用风格卡」，摘录不参与注入；要换段就把注入方式改成「摘录＋风格卡」。' }
+    }
     const shared = library.samples.filter(item => item.tags.some(tag => library.tags.includes(tag)))
     const pool = shared.length ? shared : library.samples
     if (pool.length < 2) {
@@ -715,12 +1199,15 @@ export function apply(ctx, config = {}) {
     const place = indexInPool(hit.library, hit.sample)
     return {
       // text 是真正会注入的完整段落（含说明头、规则、原文），调试对照用；
-      // sampleText 只有原文，面板上给用户看的是这个——规则说明对读者没意义。
+      // sampleText 只有原文、cardText 只有风格卡，面板上给用户看的是这两样——
+      // 规则说明对读者没意义，混在一起还会让人以为规则是样文自带的文字。
       text: sectionText(hit.library, hit.sample),
-      sampleText: hit.sample.text,
+      sampleText: hit.sample ? hit.sample.text : '',
+      cardText: usesCard(hit.library) ? cardDigest(hit.library.card) : '',
+      mode: hit.library.mode,
       via: hit.via, turn,
       library: hit.library.name, libraryId: hit.library.id,
-      sample: hit.sample.id, sampleSource: hit.sample.source,
+      sample: hit.sample ? hit.sample.id : '', sampleSource: hit.sample ? hit.sample.source : '',
       sampleIndex: place.index || 1,
       sampleTotal: place.total || hit.library.samples.length,
     }
@@ -735,11 +1222,15 @@ export function apply(ctx, config = {}) {
     const marker = MARKER.exec(str(input))
     const hit = await resolveFor(key, input, turn)
     if (!hit) {
+      const reason = data.libraries.length === 0
+        ? '还没有样文库。'
+        : (active.libraryId ? '选中的库没有样文，也没有风格卡。' : '本局没有选样文库。')
       return {
         on: false, turn, via: '', library: '', quote: '', source: '', index: 0, total: 0,
-        hint: data.libraries.length === 0 ? '还没有样文库。' : (active.libraryId ? '选中的库没有样文。' : '本局没有选样文库。'),
+        card: false, mode: 'sample', hint: reason,
       }
     }
+    const place = indexInPool(hit.library, hit.sample)
     return {
       on: true,
       turn,
@@ -747,12 +1238,72 @@ export function apply(ctx, config = {}) {
       markerTag: marker ? marker[1] : '',
       library: hit.library.name,
       libraryId: hit.library.id,
-      source: hit.sample.source,
-      quote: hit.sample.text,
-      tags: hit.sample.tags,
-      index: indexInPool(hit.library, hit.sample).index || 1,
-      total: indexInPool(hit.library, hit.sample).total || hit.library.samples.length,
+      source: hit.sample ? hit.sample.source : '',
+      // 只用风格卡时没有摘录可显示，就用卡里的三行观察顶替引文位置。
+      quote: hit.sample ? hit.sample.text : cardBrief(hit.library.card),
+      tags: hit.sample ? hit.sample.tags : (hit.library.tags || []),
+      index: place.index || 1,
+      total: place.total || hit.library.samples.length,
+      card: usesCard(hit.library),
+      mode: hit.library.mode,
     }
+  })
+
+  // ── 风格卡：存、清、提炼、盲测、导出 ──────────────────────────
+  handle('card-save', async ({ libraryId, card } = {}) => {
+    const data = await load()
+    const library = libraryOf(data, libraryId)
+    const out = await writeCard(library.id, card)
+    return { data: out.data, card: out.card, libraryId: library.id }
+  })
+
+  handle('card-clear', async ({ libraryId } = {}) => {
+    const data = await load()
+    const library = libraryOf(data, libraryId)
+    return await clearCard(library.id)
+  })
+
+  // 用本局后台模型把整库摘录提炼成一张卡。素材只取库里的摘录——
+  // 素材库里用户引用的原始材料插件读不到（那是 Tavern 的内部目录）。
+  handle('card-distill', async ({ gameId, libraryId } = {}) => {
+    const data = await load()
+    const library = libraryOf(data, libraryId)
+    if (library.samples.length === 0) throw new Error('这个库还没有样文，先存几段再提炼')
+    const reply = await runPrompt(gameId, distillPrompt(library))
+    const card = parseCardReply(reply)
+    if (!card) {
+      throw new Error('模型没有给出可用的风格卡：' + str(reply).slice(0, 160))
+    }
+    // 模型不知道语料规模，用库里的真实情况覆盖一次。
+    card.corpus = {
+      articles: library.samples.length,
+      chars: library.samples.reduce((sum, item) => sum + item.text.length, 0),
+    }
+    const out = await writeCard(library.id, card)
+    return { data: out.data, card: out.card, libraryId: library.id }
+  })
+
+  // 盲测：不给原文，只按卡写一段，再让它自己打分。写出来像不像，用户一眼就能判。
+  handle('card-test', async ({ gameId, libraryId } = {}) => {
+    const data = await load()
+    const library = libraryOf(data, libraryId)
+    if (!hasCard(library.card)) throw new Error('这个库还没有风格卡，先提炼一张')
+    const reply = await runPrompt(gameId, blindTestPrompt(library))
+    const out = parseTestReply(reply)
+    if (!out.text) throw new Error('模型没有给出试写内容：' + str(reply).slice(0, 160))
+    // 只把分数写进卡；试写正文随返回值给面板显示，不落盘。
+    const saved = await writeCard(library.id, {
+      ...library.card,
+      match: out.match || library.card.match,
+    })
+    return { data: saved.data, card: saved.card, text: out.text, match: out.match, libraryId: library.id }
+  })
+
+  // 导出便携 Prompt：不调模型，纯拼装，任何 LLM 都能用。
+  handle('export-prompt', async ({ libraryId } = {}) => {
+    const data = await load()
+    const library = libraryOf(data, libraryId)
+    return { text: cardPrompt(library), name: library.name }
   })
 
   handle('analyze', async ({ gameId, text, tags } = {}) => {
@@ -830,7 +1381,11 @@ export function apply(ctx, config = {}) {
         const libraries = data.libraries.map(libraryBrief)
         const lines = libraries.length === 0
           ? ['还没有样文库。可以新建一个，再用 style_sample_save_many 往里存摘录。']
-          : ['现有样文库：'].concat(libraries.map(item => '- 「' + item.name + '」' + (item.tags.length ? ' · ' + item.tags.join('／') : '') + ' · ' + item.count + ' 条' + (item.note ? ' · ' + item.note : '')))
+          : ['现有样文库：'].concat(libraries.map(item => '- 「' + item.name + '」'
+            + (item.tags.length ? ' · ' + item.tags.join('／') : '')
+            + ' · ' + item.count + ' 条'
+            + (item.hasCard ? ' · 有风格卡' + (item.cardMatch ? '（自评 ' + item.cardMatch + '%）' : '') : ' · 还没有风格卡')
+            + (item.note ? ' · ' + item.note : '')))
         lines.push('', '可用笔调标签：' + data.tags.join('、'))
         return { libraries, tags: data.tags, text: lines.join('\n') }
       },
@@ -920,7 +1475,8 @@ export function apply(ctx, config = {}) {
 
     add({
       name: 'style_library_save',
-      description: '新建一个样文库，或改已有库的名称与笔调标签。建库本身不存样文，存摘录用 style_sample_save_many。',
+      description: '新建一个样文库，或改已有库的名称、笔调标签与注入方式。建库本身不存样文，存摘录用 style_sample_save_many；'
+        + '攒够摘录后可以用 style_card_save 存一张风格卡（见 distill-style-library Skill）。',
       parameters: {
         type: 'object', additionalProperties: false, required: ['name'],
         properties: {
@@ -928,6 +1484,7 @@ export function apply(ctx, config = {}) {
           id: { type: 'string', description: '要修改的库 id；省略表示新建。' },
           tags: { type: 'array', items: { type: 'string' }, description: '这个库整体偏哪些笔调，最多 12 个。' },
           note: { type: 'string', description: '一两句说明，例如出自哪本书。' },
+          mode: { type: 'string', enum: ['sample', 'both', 'card'], description: '每轮注入什么：sample 只用摘录（默认）、both 摘录＋风格卡、card 只用风格卡。省略则不改。' },
         },
       },
       output: {
@@ -939,10 +1496,12 @@ export function apply(ctx, config = {}) {
       },
       async execute(args) {
         const out = await upsertLibrary(args || {})
+        const library = out.data.libraries.find(item => item.id === out.id)
         return {
           id: out.id,
           name: str(args && args.name).trim(),
-          text: '已保存样文库「' + str(args && args.name).trim() + '」（id: ' + out.id + '）。接着用 style_sample_save_many 批量存摘录。',
+          text: '已保存样文库「' + str(args && args.name).trim() + '」（id: ' + out.id + '，注入：'
+            + ((library && library.mode) || 'sample') + '）。接着用 style_sample_save_many 批量存摘录。',
         }
       },
     })
@@ -1040,7 +1599,8 @@ export function apply(ctx, config = {}) {
 
     add({
       name: 'style_library_pick',
-      description: '把某个样文库设为本局使用的文风来源。设了之后，每轮写正文都会带上它里面的一段原文作为笔调参考。传空库名表示取消。',
+      description: '把某个样文库设为本局使用的文风来源。设了之后，每轮写正文都会带上它的笔调参考'
+        + '（一段原文，或者它提炼出的风格卡，看这个库的注入方式）。传空库名表示取消。',
       parameters: {
         type: 'object', additionalProperties: false,
         properties: {
@@ -1068,9 +1628,156 @@ export function apply(ctx, config = {}) {
         const data = await load()
         const library = data.libraries.find(item => item.id === wanted) || data.libraries.find(item => item.name === wanted)
         if (!library) throw new Error('没有样文库「' + wanted + '」')
-        if (library.samples.length === 0) throw new Error('「' + library.name + '」里还没有样文，先存几段')
+        // 没有摘录时，只有「卡会真的进注入」才算可用——否则选了等于什么都没带。
+        if (library.samples.length === 0 && !usesCard(library)) {
+          throw new Error(library.card
+            ? '「' + library.name + '」里没有摘录，注入方式又是「只用摘录」，这一局什么都不会带。把注入方式改成「摘录＋风格卡」或「只用风格卡」再用。'
+            : '「' + library.name + '」里还没有样文，先存几段')
+        }
         await writeSelection(gameId, library.id, '')
-        return { ok: true, text: '本局改用样文库「' + library.name + '」，之后每轮正文都会带它的笔调参考。' }
+        return {
+          ok: true,
+          text: '本局改用样文库「' + library.name + '」，之后每轮正文都会带它的笔调参考'
+            + (usesCard(library) ? '（含风格卡）。' : '。'),
+        }
+      },
+    })
+
+    // ── 风格卡工具 ────────────────────────────────────────────
+    // 分析框架在 distill-style-library Skill 里：Agent 读完材料按 9 个维度分析，
+    // 再把结果按这里的形状存进来。存进来的东西会跟摘录一起注入正文。
+    add({
+      name: 'style_card_save',
+      description: '把一张风格卡存到某个样文库上（整库一份，会覆盖旧的）。'
+        + '卡是分析 7+1 维度后写出的结构化结论：维度观察、写作基因、铁律、禁用清单、AI 腔黑名单。'
+        + '内容要求：量化、只写反复出现 3 次以上的特征、保留矛盾、不用通用写作建议凑数。'
+        + '存之前先 style_card_get 看一眼旧卡，有就做增量修订，不要整张重写。',
+      parameters: {
+        type: 'object', additionalProperties: false, required: ['library', 'card'],
+        properties: {
+          library: { type: 'string', description: '库名或库 id。' },
+          card: {
+            type: 'object', additionalProperties: false,
+            properties: {
+              author: { type: 'string', description: '作者或书名，不知道就留空。' },
+              genre: { type: 'string', description: '体裁，例如「武侠短篇」。' },
+              summary: { type: 'string', description: '300 字以内的指纹小结。' },
+              corpus: {
+                type: 'object', additionalProperties: false,
+                properties: {
+                  articles: { type: 'number', description: '分析用了多少段/篇材料。' },
+                  chars: { type: 'number', description: '材料总字数。' },
+                },
+              },
+              dimensions: {
+                type: 'object', additionalProperties: false,
+                description: '九个维度，每个维度 3～5 条量化观察，每条不超过 140 字。',
+                properties: {
+                  lexical: { type: 'array', items: { type: 'string' }, description: '词汇：高频词、指纹词、搭配、用词质感。' },
+                  syntactic: { type: 'array', items: { type: 'string' }, description: '句法：平均句长、长短句分布、标点指纹、段落节奏。' },
+                  tonal: { type: 'array', items: { type: 'string' }, description: '语气：口语化程度、冷热、断言强弱、句长波动。' },
+                  discourse: { type: 'array', items: { type: 'string' }, description: '篇章：开头怎么起、场景怎么推进、在哪收。' },
+                  rhetoric: { type: 'array', items: { type: 'string' }, description: '修辞：比喻密度与取材、排比、设问、具体与抽象的比例。' },
+                  emotion: { type: 'array', items: { type: 'string' }, description: '情感：极性、弧线、克制度。' },
+                  perspective: { type: 'array', items: { type: 'string' }, description: '视角：人称、聚焦方式、价值词。' },
+                  imagery: { type: 'array', items: { type: 'string' }, description: '感官：视觉/听觉/触觉的权重，有没有通感。' },
+                  dialogue: { type: 'array', items: { type: 'string' }, description: '对白：长度、提示语、人物用词的区别。' },
+                },
+              },
+              genes: {
+                type: 'array', description: '3～5 条写作基因：跨两个以上维度验证过、删掉就不像了的特征。',
+                items: {
+                  type: 'object', additionalProperties: false,
+                  properties: {
+                    name: { type: 'string', description: '4～6 字的名称。' },
+                    text: { type: 'string', description: '一句话说清它是什么、由哪几个维度支撑。' },
+                  },
+                },
+              },
+              laws: { type: 'array', items: { type: 'string' }, description: '6～10 条铁律，落到操作层，能照着写也能自检。' },
+              disallowed: { type: 'array', items: { type: 'string' }, description: '5～10 条：这段文字从不做的事。' },
+              aiBan: { type: 'array', items: { type: 'string' }, description: 'AI 腔词句黑名单，最多 20 个。' },
+              mantra: { type: 'string', description: '30 字以内的起笔口诀。' },
+              formula: { type: 'string', description: '推荐的叙事公式，一句话说明为什么。' },
+              match: { type: 'number', description: '盲测自评的贴合度 0～100，没测就不填。' },
+            },
+          },
+        },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            ok: { type: 'boolean' }, library: { type: 'string' },
+            counts: { type: 'object', additionalProperties: true },
+            text: { type: 'string' },
+          },
+        },
+        render: (_args, value) => [{ type: 'text', text: String((value && value.text) || '') }],
+      },
+      async execute(args) {
+        const wanted = str(args && args.library).trim()
+        if (!wanted) throw new Error('要指定样文库名或 id')
+        const data = await load()
+        const library = libraryOf(data, wanted)
+        const out = await writeCard(library.id, args && args.card)
+        const card = out.card
+        const counts = {
+          dimensions: Object.keys(card.dimensions).length,
+          genes: card.genes.length,
+          laws: card.laws.length,
+          disallowed: card.disallowed.length,
+          aiBan: card.aiBan.length,
+        }
+        return {
+          ok: true,
+          library: library.name,
+          counts,
+          text: '风格卡已存进「' + library.name + '」：' + counts.dimensions + ' 个维度、'
+            + counts.genes + ' 条写作基因、' + counts.laws + ' 条铁律、'
+            + counts.disallowed + ' 条禁用、' + counts.aiBan + ' 个 AI 腔词。\n'
+            + '这一步还没让它真正生效：要注入得把这个库的 mode 设成 both 或 card'
+            + '（style_library_save 传 mode），或者提醒用户去面板里改。',
+        }
+      },
+    })
+
+    add({
+      name: 'style_card_get',
+      description: '读某个样文库现有的风格卡（维度观察、基因、铁律、禁用清单）和它当前的注入方式。'
+        + '要在旧卡上做增量修订、或想知道这个库还缺什么时先调它。',
+      parameters: {
+        type: 'object', additionalProperties: false, required: ['library'],
+        properties: { library: { type: 'string', description: '库名或库 id。' } },
+      },
+      output: {
+        schema: {
+          type: 'object', additionalProperties: false,
+          properties: {
+            ok: { type: 'boolean' }, mode: { type: 'string' },
+            card: { type: 'object', additionalProperties: true },
+            text: { type: 'string' },
+          },
+        },
+        render: (_args, value) => [{ type: 'text', text: String((value && value.text) || '') }],
+      },
+      isConcurrencySafe: () => true,
+      async execute(args) {
+        const data = await load(true)
+        const library = libraryOf(data, args && args.library)
+        if (!hasCard(library.card)) {
+          return {
+            // 输出 schema 声明 card 是 object，这里给空对象而不是 null——
+            // 校验按 schema 走的话，null 会让整次调用被判定为不合格。
+            ok: false, mode: library.mode, card: {},
+            text: '「' + library.name + '」还没有风格卡。库里现有 ' + library.samples.length
+              + ' 条摘录，可以先读这些摘录做分析，再用 style_card_save 存卡。',
+          }
+        }
+        return {
+          ok: true, mode: library.mode, card: library.card,
+          text: '「' + library.name + '」的风格卡（注入方式：' + library.mode + '）：\n' + cardDigest(library.card),
+        }
       },
     })
 
