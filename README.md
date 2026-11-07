@@ -240,4 +240,4 @@ mv /tmp/dsh-tavern-style-library-main "$DSH_HOME/profile-data/tavern/data/plugin
 
 ---
 
-想改这个插件本身，或者想知道它内部怎么实现的，看 [DEVELOPMENT.md](DEVELOPMENT.md)。
+想改这个插件本身，或者想知道它内部怎么实现的，看 [DEVELOPMENT.md](DEVELOPMENT.md)。各版本改了什么，看 [CHANGELOG.md](CHANGELOG.md)。
