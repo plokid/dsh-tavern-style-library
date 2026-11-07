@@ -16,13 +16,30 @@
 ## 跑测试
 
 ```sh
-node verify.mjs        # 宿主侧：切段、轮换、工具行为、注入、风格卡、容错（90 项）
-node smoke-client.mjs  # 浏览器侧：模块加载、注册调用、布局与交互约定、组件渲染（41 项）
+node verify.mjs        # 宿主侧：切段、轮换、工具行为、注入、风格卡、上一版、容错（103 项）
+node smoke-client.mjs  # 浏览器侧：注册接线、布局约定、组件渲染、交互（48 项）
 ```
 
 两个都用假的 `tavern` / `tavernUi` / `tools` 服务跑真实代码路径，不连真环境，也不需要装任何依赖。
 
 改了 `index.mjs` 需要重启 DSH；改了 `client.js` 刷新页面即可。
+
+### 浏览器侧的两种 React 替身
+
+`smoke-client.mjs` 里有两份最小 React，用途不同：
+
+| 替身 | 能做什么 | 用来测 |
+| --- | --- | --- |
+| `React`（静态） | `createElement` + 空 hooks | 注册接线、类名、布局约定、源码里的约定 |
+| `makeRuntime()`（会更新） | 状态真的更新、真的重渲染、能派发事件 | 点按钮、改输入框、保存、失败回滚 |
+
+交互测试的写法：`runtime.mount(createElement(Editor, props))` → `byText` / `byLabel` 找到节点 → 调 `props.onClick()` / `props.onChange({target:{value}})` → `await runtime.settle()` → 断言宿主收到了什么。同一份源码配不同的 React 各加载一次（`loadWith(react)`），互不干扰。
+
+三个坑，改这个文件前先看一眼：
+
+1. **组件必须用 `createElement` 挂上去**，不能 `Editor(props)` 直接调用——直接调用等于在渲染器外面跑，hook 全落到错误的槽位上。
+2. **`props.children` 要摊成 children**。`<Button>编辑</Button>` 的文案是走 `props.children` 进的（`Button` 把 `...rest` 整个透传给 `<button>`），替身不认这条，按钮上的字就读不到，「按文案找按钮」永远找不到。
+3. **一次 `mount` 就是一棵新树**，要清空槽位；不清的话第二次挂载会复用上一次的状态，测出来的是上一棵树。
 
 ## 兼容性
 

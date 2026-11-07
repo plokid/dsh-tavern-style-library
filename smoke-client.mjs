@@ -13,17 +13,150 @@ async function check(name, fn) {
   catch (error) { fails.push({ name, error }); console.log('  FAIL ' + name + '\n       ' + (error?.message || error)) }
 }
 
+// ── 元素工厂 ─────────────────────────────────────────────────
+// 真 React 里 <Button>编辑</Button> 的 children 是走 props.children 进来的
+// （Button 把 ...rest 整个透传给 <button>）。替身要照做，否则按钮上的字读不到，
+// 「按文案找按钮」就永远找不到。
+function makeElement(type, props, children) {
+  const source = props || {}
+  const { children: nested, ...rest } = source
+  const flat = children.flat(Infinity).filter(item => item !== null && item !== undefined && item !== false)
+  const kids = flat.length ? flat : normalizeChildren(nested)
+  return { type, props: rest, children: kids }
+}
+const normalizeChildren = value => (value === undefined || value === null || value === false ? []
+  : Array.isArray(value) ? value.flat(Infinity).filter(item => item !== null && item !== undefined && item !== false)
+  : [value])
+
 // ── 最小 React 替身：只要能加载模块、调用 createElement ──────────
 const React = {
-  createElement: (type, props, ...children) => ({
-    type, props: props || {},
-    children: children.flat(Infinity).filter(item => item !== null && item !== undefined && item !== false),
-  }),
+  createElement: (type, props, ...children) => makeElement(type, props, children),
   useState: initial => [typeof initial === 'function' ? initial() : initial, () => {}],
   useEffect: () => {},
   useCallback: fn => fn,
   Fragment: 'div',
 }
+
+// ── 会真正更新的 React 替身 ───────────────────────────────────
+// 上面那个只能证明「渲染不抛错」。但漏掉的问题都在交互里：点了没反应、
+// 存失败界面不回滚、某个按钮该弹确认却直接跑了。这里做一份最小实现：
+// 状态真的会更新、真的会重渲染，于是测试可以点按钮、改输入框、看结果。
+function makeRuntime() {
+  const slots = new Map()
+  const pending = []
+  let path = ''
+  let dirty = true
+  let rootElement = null
+  let depth = 0
+
+  const slotOf = key => {
+    if (!slots.has(key)) slots.set(key, { cursor: 0, values: [], callbacks: [], effects: [] })
+    return slots.get(key)
+  }
+  const sameDeps = (a, b) => Boolean(a && b && a.length === b.length && a.every((item, index) => item === b[index]))
+
+  const React = {
+    Fragment: 'div',
+    createElement: (type, props, ...children) => makeElement(type, props, children),
+    useState(initial) {
+      const slot = slotOf(path)
+      const index = slot.cursor++
+      if (!(index in slot.values)) {
+        slot.values[index] = typeof initial === 'function' ? initial() : initial
+      }
+      const set = value => {
+        const next = typeof value === 'function' ? value(slot.values[index]) : value
+        if (Object.is(next, slot.values[index])) return
+        slot.values[index] = next
+        dirty = true
+      }
+      return [slot.values[index], set]
+    },
+    useCallback(fn, deps) {
+      const slot = slotOf(path)
+      const index = slot.cursor++
+      const prev = slot.callbacks[index]
+      if (prev && sameDeps(prev.deps, deps)) return prev.fn
+      slot.callbacks[index] = { fn, deps }
+      return fn
+    },
+    useEffect(fn, deps) {
+      const slot = slotOf(path)
+      const index = slot.cursor++
+      const prev = slot.effects[index]
+      if (prev && sameDeps(prev.deps, deps)) return
+      slot.effects[index] = { deps }
+      pending.push(fn)
+    },
+  }
+
+  function renderNode(element, key) {
+    if (element === null || element === undefined || typeof element !== 'object') return element
+    if (Array.isArray(element)) return element.map((child, index) => renderNode(child, key + '/' + index))
+    const slot = slotOf(key)
+    slot.cursor = 0
+    if (typeof element.type === 'function') {
+      const prev = path
+      path = key
+      const out = element.type({ ...element.props, children: element.children })
+      path = prev
+      element.rendered = renderNode(out, key + '>')
+      return element
+    }
+    element.rendered = (element.children || []).map((child, index) => renderNode(child, key + '/' + index))
+    return element
+  }
+
+  function render() {
+    dirty = false
+    renderNode(rootElement, 'root')
+    const queued = pending.splice(0)
+    for (const effect of queued) {
+      try { effect() } catch { /* 副作用出错不该拖垮测试 */ }
+    }
+    return rootElement
+  }
+
+  return {
+    React,
+    mount(element) {
+      // 一次 mount 就是一棵新树：不清槽位的话，第二次挂载会复用上一次的状态，
+      // 测出来的是上一棵树的样子（这条踩过：两个 mount 共用 draft，按钮找不着）。
+      slots.clear()
+      pending.length = 0
+      rootElement = element
+      return render()
+    },
+    // 状态更新是同步写、异步渲染：等两轮微任务再渲染一次，事件处理里的 await 才能落地
+    async settle() {
+      for (let i = 0; i < 4; i += 1) {
+        await Promise.resolve()
+        if (dirty) render()
+      }
+      await new Promise(resolve => setTimeout(resolve, 0))
+      if (dirty) render()
+      return rootElement
+    },
+  }
+}
+
+const textOf = node => (node.children || []).filter(item => typeof item === 'string' || typeof item === 'number').join('')
+
+function walk(node, visit) {
+  if (node === null || node === undefined || typeof node !== 'object') return
+  if (Array.isArray(node)) { node.forEach(child => walk(child, visit)); return }
+  visit(node)
+  walk(node.rendered !== undefined ? node.rendered : node.children, visit)
+}
+
+function findAll(root, predicate) {
+  const out = []
+  walk(root, node => { if (node.type && predicate(node)) out.push(node) })
+  return out
+}
+
+const byText = (root, text) => findAll(root, node => node.type === 'button' && textOf(node) === text)
+const byLabel = (root, label) => findAll(root, node => node.props && node.props['aria-label'] === label)
 
 // ── 假宿主：记录注册调用 ─────────────────────────────────────
 function makeUi(hosts) {
@@ -71,21 +204,29 @@ const hosts = {
 }
 
 // ── 加载插件 ─────────────────────────────────────────────────
-let factory = null
-globalThis.window = { __ModuleLoader__: { load: definition => { factory = definition.factory } } }
 const source = fs.readFileSync('./client.js', 'utf8')
 // 组件都是模块内私有的，想真的渲染一次就得把它们捞出来：在工厂 return 之前
 // 挂一个探针。只改运行时用的那份字符串，源码本身不动。
 const patched = source.replace('return {\n      name: SELF,', 'globalThis.__probe = { Editor, StyleCardBlock, CardEditor, cardToForm, formToCard }\n    return {\n      name: SELF,')
 assert.ok(patched !== source, '没找到工厂返回处，探针插不进去')
-// eslint-disable-next-line no-new-func
-new Function('window', 'React', patched)(globalThis.window, React)
 
-await check('模块加载后拿到工厂函数', () => {
-  assert.equal(typeof factory, 'function')
+// 同一份源码可以配不同的 React 各加载一次：静态检查用最简替身，
+// 交互测试用会真更新状态的替身。
+function loadWith(react) {
+  let made = null
+  globalThis.window = { __ModuleLoader__: { load: definition => { made = definition.factory } } }
+  globalThis.__probe = null
+  // eslint-disable-next-line no-new-func
+  new Function('window', 'React', patched)(globalThis.window, react)
+  const instance = made(() => react)
+  return { instance, probe: globalThis.__probe }
+}
+
+const { instance: plugin } = loadWith(React)
+
+await check('模块加载后拿到插件实例', () => {
+  assert.equal(typeof plugin.apply, 'function')
 })
-
-const plugin = factory(() => React)
 await check('导出名与 package.json 一致', () => {
   const pkg = JSON.parse(fs.readFileSync('./package.json', 'utf8'))
   assert.equal(plugin.name, pkg.name)
@@ -191,7 +332,7 @@ await check('状态分节沿用原版「文风联想」的版式类名', () => {
 await check('没有 registerStatusSection 时静默跳过，其余照常', () => {
   const partial = makeUi(hosts)
   delete partial.registerStatusSection
-  const other = factory(() => React)
+  const other = loadWith(React).instance
   other.apply({ tavernUi: partial }) // 不应抛错
   assert.equal(partial.calls.panel.length, 1)
 })
@@ -199,7 +340,7 @@ await check('没有 registerStatusSection 时静默跳过，其余照常', () =>
 await check('没有 watchTurnState 时也不影响加载', () => {
   const partial = makeUi(hosts)
   delete partial.watchTurnState
-  const other = factory(() => React)
+  const other = loadWith(React).instance
   other.apply({ tavernUi: partial })
   assert.equal(partial.calls.status.length, 1)
 })
@@ -207,7 +348,7 @@ await check('没有 watchTurnState 时也不影响加载', () => {
 await check('接口版本过低时什么也不注册', () => {
   const partial = makeUi(hosts)
   partial.apiVersion = 1
-  const other = factory(() => React)
+  const other = loadWith(React).instance
   other.apply({ tavernUi: partial })
   assert.equal(partial.calls.panel.length, 0)
   assert.equal(partial.calls.status.length, 0)
@@ -251,7 +392,7 @@ await check('状态分节跳转用 seed 对象调 openTab', () => {
     getTab: id => (id === 'tavern-plugin:dsh-tavern-style-library:style-library' ? { id } : undefined),
     isTabEnabled: () => true,
   }
-  const other = factory(() => React)
+  const other = loadWith(React).instance
   other.apply({ tavernUi: harness, betterSidebar: sidebar })
   openViaStatus(harness, 'g1')
   assert.equal(opened.length, 1, '应调用一次 openTab')
@@ -268,7 +409,7 @@ await check('不会再出现「点了没动静」：打开不了就给出可见�
   harness.openOverlay = () => { overlaid = true }
   // 页没注册上（getTab 拿不到）→ 不能静默，要弹说明
   const sidebar = { openTab() {}, getTab: () => undefined, isTabEnabled: () => true }
-  const other = factory(() => React)
+  const other = loadWith(React).instance
   other.apply({ tavernUi: harness, betterSidebar: sidebar })
   openViaStatus(harness, 'g1')
   assert.ok(overlaid, '打开不了时应弹提示，而不是什么都不发生')
@@ -279,7 +420,7 @@ await check('打开的页被用户在侧栏设置里关掉时也给提示', () =
   let overlaid = false
   harness.openOverlay = () => { overlaid = true }
   const sidebar = { openTab() {}, getTab: id => ({ id }), isTabEnabled: () => false }
-  const other = factory(() => React)
+  const other = loadWith(React).instance
   other.apply({ tavernUi: harness, betterSidebar: sidebar })
   openViaStatus(harness, 'g1')
   assert.ok(overlaid, '页被禁用时应提示去哪打开，而不是静默')
@@ -304,7 +445,7 @@ await check('没有 betterSidebar 时退回提示遮罩，不抛错', () => {
   const harness = makeUi(hosts)
   let overlaid = false
   harness.openOverlay = () => { overlaid = true }
-  const other = factory(() => React)
+  const other = loadWith(React).instance
   other.apply({ tavernUi: harness })
   openViaStatus(harness, 'g1')
   assert.equal(overlaid, true, '应给出兜底提示')
@@ -317,7 +458,7 @@ await check('样式表被注入到 head', () => {
     createElement: () => ({ id: '', textContent: '' }),
     head: { appendChild: node => injected.push(node) },
   }
-  const other = factory(() => React)
+  const other = loadWith(React).instance
   const harness = makeUi(hosts)
   other.apply({ tavernUi: harness })
   assert.equal(injected.length, 1, '应注入一段样式')
@@ -562,6 +703,103 @@ await check('编辑表单能渲染', () => {
   assert.ok(tree.includes('指纹小结'), '没有指纹小结输入')
   assert.ok(tree.includes('写作基因'), '没有写作基因输入')
   assert.ok(tree.includes('单音节动词多'), '没有把现有内容填进去')
+})
+
+console.log('\n== 交互（点、改、存）==')
+
+// 静态断言只能证明「渲染不抛错」。真正出事的地方是交互：点了没反应、
+// 存失败界面不回滚、该弹确认的按钮直接跑了。这一段用会更新状态的 React 替身
+// 真点一遍。
+const runtime = makeRuntime()
+const { probe: rtProbe } = loadWith(runtime.React)
+// 注意要用 createElement 把组件「挂上去」，不能直接调用 Editor(props)：
+// 直接调用等于在渲染器外面跑一遍，hook 全落到错误的槽位上。
+const mountEditor = (ui, library) => runtime.mount(runtime.React.createElement(rtProbe.Editor, {
+  gameId: 'g1', ui, tags: [], library, onClose: () => {}, onChanged: () => {},
+}))
+
+await check('点「编辑」改一条铁律，保存后宿主收到新卡', async () => {
+  const saved = []
+  const ui = makeUi({
+    'card-save': async payload => { saved.push(payload); return { card: payload.card } },
+  })
+  const tree = mountEditor(ui, { ...baseLibrary, card: sampleCard })
+
+  const edit = byText(tree, '编辑')[0]
+  assert.ok(edit, '没找到「编辑」按钮')
+  edit.props.onClick()
+  await runtime.settle()
+
+  const laws = byLabel(tree, '铁律')[0]
+  assert.ok(laws, '编辑态里没有铁律输入框')
+  assert.ok(laws.props.value.includes('每段至少一个可触的物件'), '编辑框里应该带着现有内容')
+
+  laws.props.onChange({ target: { value: '只留一条铁律' } })
+  await runtime.settle()
+
+  const save = byText(tree, '保存')[0]
+  assert.ok(save, '没找到保存按钮')
+  save.props.onClick()
+  await runtime.settle()
+
+  assert.equal(saved.length, 1, '应该调用一次 card-save')
+  assert.deepEqual(saved[0].card.laws, ['只留一条铁律'], '改过的铁律没传出去')
+  // 没在表单里出现的字段要原样带回去
+  assert.equal(saved[0].card.author, sampleCard.author, '作者被冲掉了')
+  assert.deepEqual(saved[0].card.dimensions, sampleCard.dimensions, '维度被冲掉了')
+  assert.ok(!byLabel(tree, '铁律').length, '保存后应退出编辑态')
+})
+
+await check('切注入方式保存失败时，下拉会拨回去', async () => {
+  const ui = makeUi({
+    'save-library': async () => { throw new Error('库快满了，存不下') },
+  })
+  const tree = mountEditor(ui, { ...baseLibrary, mode: 'sample', card: null })
+
+  const before = findAll(tree, node => node.type === 'select')[0]
+  assert.equal(before.props.value, 'sample', '初始值不对')
+  before.props.onChange({ target: { value: 'both' } })
+  await runtime.settle()
+
+  const after = findAll(tree, node => node.type === 'select')[0]
+  assert.equal(after.props.value, 'sample', '保存失败后下拉该回到原值，否则界面和库里对不上')
+  assert.ok(JSON.stringify(tree).includes('库快满了'), '错误要显示出来，不能只是悄悄回滚')
+})
+
+await check('点「重新提炼」先出确认，取消就不调模型', async () => {
+  let calls = 0
+  const ui = makeUi({
+    'card-distill': async () => { calls += 1; return { card: sampleCard } },
+  })
+  const tree = mountEditor(ui, { ...baseLibrary, card: sampleCard })
+
+  byText(tree, '重新提炼')[0].props.onClick()
+  await runtime.settle()
+  assert.equal(calls, 0, '还没确认就调了模型')
+  assert.ok(JSON.stringify(tree).includes('会再调一次后台模型'), '应先展开确认条')
+
+  byText(tree, '取消')[0].props.onClick()
+  await runtime.settle()
+  assert.equal(calls, 0, '取消之后不该调模型')
+
+  byText(tree, '重新提炼')[0].props.onClick()
+  await runtime.settle()
+  const confirm = byText(tree, '确认重新提炼')[0]
+  assert.ok(confirm, '确认条上没有确认按钮')
+  confirm.props.onClick()
+  await runtime.settle()
+  assert.equal(calls, 1, '确认之后应该正好调一次')
+})
+
+await check('有上一版才有「恢复上一版」按钮', async () => {
+  const withoutPrev = mountEditor(makeUi({}), { ...baseLibrary, card: sampleCard })
+  assert.equal(byText(withoutPrev, '恢复上一版').length, 0, '没有上一版时不该出现这个按钮')
+
+  const withPrev = mountEditor(makeUi({}), {
+    ...baseLibrary,
+    card: { ...sampleCard, previous: { ...sampleCard, laws: ['上一版的铁律'] } },
+  })
+  assert.equal(byText(withPrev, '恢复上一版').length, 1, '有上一版时应给出入口')
 })
 
 console.log('\n结果：' + pass + ' 通过，' + fails.length + ' 失败\n')
